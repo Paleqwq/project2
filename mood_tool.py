@@ -689,11 +689,28 @@ class MoodApp:
         if idx == 0:
             self.page_quick.pack_forget()
             self.page_weather.pack(fill="both", expand=True)
+            self.root.update_idletasks()  # 让 Canvas 完成 layout
             self._render_weather()
+            self._refresh_scroll(self.page_weather)
         else:
             self.page_weather.pack_forget()
             self.page_quick.pack(fill="both", expand=True)
+            self.root.update_idletasks()  # 让 Canvas 完成 layout
             self._render_quick()
+            self._refresh_scroll(self.page_quick)
+
+    def _refresh_scroll(self, container):
+        """强制刷新滚动容器的 inner 宽度和 scrollregion，
+        修复封包后 <Configure> 事件链不可靠导致内容不显示的问题"""
+        try:
+            container.update_idletasks()
+            canvas_w = container.canvas.winfo_width()
+            if canvas_w > 1:
+                container.canvas.itemconfig(container.canvas_win, width=canvas_w)
+            container.update_idletasks()
+            container.canvas.configure(scrollregion=container.canvas.bbox("all"))
+        except tk.TclError:
+            pass
 
     def _render_weather(self):
         c = self.page_weather.inner
@@ -791,6 +808,7 @@ class MoodApp:
             self.status_label.config(text=f"已同步 · {res['city']} {res['desc']} {temp_text}")
             tips = WeatherTipsDB.get(res["code"], temp)
             self._populate_suggestions(tips)
+            self._refresh_scroll(self.page_weather)
             # 脉冲效果
             try: self.animator.pulse(self.w_icon.master.master, T["border_light"], T["accent_light"], 1000)
             except: pass
@@ -802,6 +820,7 @@ class MoodApp:
             self.status_label.config(text="网络异常 · 已启用离线建议")
             self.status_dot.config(fg=T["warn"])
             self._populate_suggestions(WeatherTipsDB.offline())
+            self._refresh_scroll(self.page_weather)
 
     def _populate_suggestions(self, tips):
         if not self.suggest_container or not self.suggest_container.winfo_exists(): return
