@@ -313,7 +313,7 @@ class WeatherService:
 # 🧱 高级 UI 组件
 # ============================================================
 class SmoothScrollContainer(tk.Frame):
-    """带惯性的平滑滚动容器"""
+    """带惯性的平滑滚动容器 + 可拖拽滚动条（方便鼠标精确定位）"""
     def __init__(self, parent, animator):
         super().__init__(parent, bg=T["bg"])
         self.animator = animator
@@ -322,9 +322,17 @@ class SmoothScrollContainer(tk.Frame):
         self._rendered = False
         self._syncing = False
         self.canvas = tk.Canvas(self, bg=T["bg"], highlightthickness=0, bd=0)
+        # 可拖拽滚动条 —— 用户可以直接抓取滑块精确定位到任意位置
+        self.scrollbar = ttk.Scrollbar(
+            self, orient="vertical", command=self._on_scrollbar,
+            style="Mood.Vertical.TScrollbar",
+        )
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
         self.inner = tk.Frame(self.canvas, bg=T["bg"])
         self.inner.bind("<Configure>", self._on_frame_configure)
         self.canvas_win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        # 先放滚动条，再让 canvas 占据剩余空间，避免被压缩成 0 宽
+        self.scrollbar.pack(side="right", fill="y", padx=(2, 6), pady=4)
         self.canvas.pack(side="left", fill="both", expand=True)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         # 冗余：把 <Configure> 也绑在外层 Frame 与 <Map> 上。
@@ -399,6 +407,12 @@ class SmoothScrollContainer(tk.Frame):
             self.is_scrolling = True
             self._inertia_scroll()
 
+    def _on_scrollbar(self, *args):
+        # 用户主动拖拽 / 点击滑块时，立即终止惯性滚动，避免抖动
+        self.scroll_velocity = 0
+        self.is_scrolling = False
+        self.canvas.yview(*args)
+
     def _inertia_scroll(self):
         if abs(self.scroll_velocity) < 0.5:
             self.is_scrolling = False
@@ -467,7 +481,18 @@ class RoundedFrame(tk.Canvas):
 
 
 class GlowCard(tk.Frame):
-    """带悬停发光效果的卡片（柔和厚边框模拟圆角视觉）"""
+    """带悬停发光效果的卡片（柔和厚边框模拟圆角视觉）
+
+    关键修复（解决"鼠标移到卡片上底下的光不流畅"）：
+    1. Enter/Leave 动画都从 *当前实际颜色* 起步，不再硬编码起点，
+       这样快速进出鼠标时不会出现颜色"跳变"。
+    2. 通过 token 让旧动画静默失效，避免多个动画同时写
+       highlightbackground 互相抢占，产生闪烁。
+    3. 把 Enter/Leave 也绑到所有子控件上：tk 的 <Leave> 会在鼠标
+       从父卡片移到内部 Label/Frame 的瞬间触发，原实现因此会
+       不停 leave→enter→leave 循环，看起来就是"光晕在抖"。
+       现在统一用「鼠标是否真的还在卡片矩形内」作为权威判断。
+    """
     def __init__(self, parent, animator, glow_color=None, radius=14):
         # 使用厚边框 + 浅色边框模拟柔和圆角的视觉效果
         super().__init__(parent, bg=T["card"], bd=0,
@@ -475,21 +500,128 @@ class GlowCard(tk.Frame):
         self.animator = animator
         self.glow_color = glow_color or T["glow"]
         self.radius = radius  # 保留参数兼容旧调用，不再使用
-        self.bind("<Enter>", lambda e: self._animate_hover(True))
-        self.bind("<Leave>", lambda e: self._animate_hover(False))
+        self._base_color = T["border_light"]
+        self._current_color = self._base_color
+        self._is_hovered = False
+        self._anim_token = 0
+        self._bound_widgets = set()
+        self._leave_pending = False
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        # 首次显示后把 Enter/Leave 也绑到所有后代控件
+        self.bind("<Map>", lambda e: self._bind_descendants())
 
     def pack_content(self):
         """返回自身作为内容容器（兼容旧 API）"""
         return self
 
-    def _animate_hover(self, entering):
-        start = T["border_light"] if entering else self.glow_color
-        end = self.glow_color if entering else T["border_light"]
-        def _update(progress):
-            color = Animator._lerp_color(start, end, progress)
-            try: self.configure(highlightbackground=color)
-            except tk.TclError: pass
-        self.animator.animate(250, _update, easing=AnimationEngine.ease_out_expo)
+    def _bind_descendants(self):
+        try:
+            self._bind_recursive(self)
+        except tk.TclError:
+            pass
+        # 子树可能在 Map 之后才完全建好（如 _populate_suggestions 里再追加内容），
+        # 短延迟后再扫一次，确保新加入的子控件也被覆盖到。
+        self.after(120, self._bind_recursive_safe)
+
+    def _bind_recursive_safe(self):
+        try:
+            self._bind_recursive(self)
+        except tk.TclError:
+            pass
+
+    def _bind_recursive(self, w):
+        for child in w.winfo_children():
+            if child not in self._bound_widgets:
+                try:
+                    child.bind("<Enter>", self._on_enter, add="+")
+                    child.bind("<Leave>", self._on_leave, add="+")
+                    self._bound_widgets.add(child)
+                except tk.TclError:
+                    continue
+            self._bind_recursive(child)
+
+    def _mouse_inside(self):
+        try:
+            x, y = self.winfo_pointerxy()
+            wx, wy = self.winfo_rootx(), self.winfo_rooty()
+            ww, wh = self.winfo_width(), self.winfo_height()
+            return wx <= x < wx + ww and wy <= y < wy + wh
+        except tk.TclError:
+            return False
+
+    def _on_enter(self, _event=None):
+        if self._is_hovered:
+            return
+        self._is_hovered = True
+        self._animate_to(self.glow_color)
+
+    def _on_leave(self, _event=None):
+        # 子→父 / 父→子 切换时也会触发 <Leave>，所以延迟一帧再判断
+        # 鼠标是否真的离开卡片矩形，避免误退出造成抖动。
+        if self._leave_pending:
+            return
+        self._leave_pending = True
+        self.after(30, self._maybe_leave)
+
+    def _maybe_leave(self):
+        self._leave_pending = False
+        if not self.winfo_exists():
+            return
+        if self._mouse_inside():
+            return
+        if not self._is_hovered:
+            return
+        self._is_hovered = False
+        self._animate_to(self._base_color)
+
+    def _animate_to(self, target):
+        # 失效之前还在跑的动画 —— 它们的 _update 会在 token 不匹配时直接返回
+        self._anim_token += 1
+        token = self._anim_token
+        start = self._current_color
+
+        def _update(p):
+            if token != self._anim_token:
+                return
+            color = Animator._lerp_color(start, target, p)
+            self._current_color = color
+            try:
+                self.configure(highlightbackground=color)
+            except tk.TclError:
+                pass
+        # 320ms + ease_out_cubic：足够让鼠标快速划过时也能保持平滑感
+        self.animator.animate(320, _update, easing=AnimationEngine.ease_out_cubic)
+
+    def pulse_glow(self, accent_color=None, duration=900):
+        """一次性高亮脉冲，与 hover 系统协同（不会再被 hover 动画抢占）。"""
+        accent = accent_color or self.glow_color
+        self._anim_token += 1
+        token = self._anim_token
+        start = self._current_color
+        peak = accent
+
+        def _update(p):
+            if token != self._anim_token or not self.winfo_exists():
+                return
+            # 0→0.5 上升、0.5→1 回落；如果中途用户开始悬停，就由 _animate_to 接管
+            t = p * 2 if p < 0.5 else 2 - p * 2
+            color = Animator._lerp_color(start, peak, t)
+            self._current_color = color
+            try:
+                self.configure(highlightbackground=color)
+            except tk.TclError:
+                pass
+
+        def _done():
+            if token == self._anim_token and not self._is_hovered:
+                self._current_color = self._base_color
+                try:
+                    self.configure(highlightbackground=self._base_color)
+                except tk.TclError:
+                    pass
+        self.animator.animate(duration, _update, on_complete=_done,
+                              easing=AnimationEngine.ease_in_out_quart)
 
 
 class AnimatedExpandCard(tk.Frame):
@@ -792,6 +924,9 @@ class MoodApp:
 
         weather_card = GlowCard(c, self.animator, glow_color=T["accent_light"])
         weather_card.pack(fill="x", padx=30, pady=(24, 16))
+        # 保存引用，让 _apply_weather 的脉冲走 GlowCard 协同通道，
+        # 避免直接写 highlightbackground 与 hover 动画相互抢占
+        self.weather_card = weather_card
         wi = tk.Frame(weather_card, bg=T["card"], padx=36, pady=32)
         wi.pack(fill="x")
 
@@ -888,9 +1023,12 @@ class MoodApp:
             tips = WeatherTipsDB.get(res["code"], temp)
             self._populate_suggestions(tips)
             self._refresh_scroll(self.page_weather)
-            # 脉冲效果
-            try: self.animator.pulse(self.w_icon.master.master, T["border_light"], T["accent_light"], 1000)
-            except: pass
+            # 走 GlowCard 自身的脉冲通道，与 hover 动画协同（不会互相抢色）
+            try:
+                if hasattr(self, "weather_card") and self.weather_card.winfo_exists():
+                    self.weather_card.pulse_glow(T["accent_light"], duration=1000)
+            except Exception:
+                pass
         else:
             self.lbl_temp.config(text="--°C", fg=T["warn"])
             self.lbl_desc.config(text="天气同步失败，已为您切换为离线建议", fg=T["warn"])
@@ -988,6 +1126,23 @@ if __name__ == "__main__":
         pass
     style = ttk.Style()
     style.theme_use("clam")
+    # 自定义滚动条样式：主题配色 + 悬停/拖动反馈，方便用户精确定位
+    style.configure(
+        "Mood.Vertical.TScrollbar",
+        troughcolor=T["nav_bg"],
+        background=T["prim_light"],
+        bordercolor=T["nav_bg"],
+        arrowcolor=T["prim"],
+        gripcount=0,
+        relief="flat",
+        borderwidth=0,
+    )
+    style.map(
+        "Mood.Vertical.TScrollbar",
+        background=[("active", T["prim"]), ("pressed", T["prim_dark"])],
+        arrowcolor=[("active", T["prim_dark"])],
+    )
+    # 兼容旧引用
     style.configure("TScrollbar", troughcolor=T["bg"], background=T["prim_light"],
                     bordercolor=T["bg"], arrowcolor=T["prim"])
     app = MoodApp(root)
