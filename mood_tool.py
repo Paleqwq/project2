@@ -700,8 +700,17 @@ class MoodApp:
         # 即便 PyInstaller 封包后 Canvas <Configure> 事件链不可靠，
         # 内容的 widget 也已经存在；切换页面后只需要把宽度对齐到 canvas 即可。
         # 这一步对解决"封包后点击快捷调节看不到心情卡片"非常关键。
-        self._render_weather()
-        self._render_quick()
+        # 用 try/except 兜底：万一渲染过程里某个 widget 选项不被当前 Tcl 构建
+        # 接受（比如老 Tk 不认 Frame pady tuple），不要把整个 app 拖崩，
+        # 切换页面时还有惰性渲染兜底。
+        try:
+            self._render_weather()
+        except Exception as e:
+            sys.stderr.write(f"[mood_tool] eager render weather failed: {e!r}\n")
+        try:
+            self._render_quick()
+        except Exception as e:
+            sys.stderr.write(f"[mood_tool] eager render quick failed: {e!r}\n")
         self._refresh_weather()
         self._start_ambient()
 
@@ -780,7 +789,6 @@ class MoodApp:
         c = self.page_weather.inner
         if self.page_weather._rendered:
             return
-        self.page_weather._rendered = True
 
         weather_card = GlowCard(c, self.animator, glow_color=T["accent_light"])
         weather_card.pack(fill="x", padx=30, pady=(24, 16))
@@ -808,15 +816,20 @@ class MoodApp:
         self.suggest_container.pack(fill="x", padx=28)
         tk.Label(self.suggest_container, text="正在为您匹配最契合当前天气的情绪调节方案... ✨",
                 font=F["body"], fg=T["text_s"], bg=T["bg"]).pack(anchor="w", padx=5)
+        # 仅在全部 widget 创建成功后再标记已渲染，
+        # 避免中途异常把页面卡在"_rendered=True 但内容残缺"的状态。
+        self.page_weather._rendered = True
 
     def _render_quick(self):
         c = self.page_quick.inner
         if self.page_quick._rendered:
             return
-        self.page_quick._rendered = True
 
-        hf = tk.Frame(c, bg=T["bg"], padx=30, pady=(20, 12))
-        hf.pack(fill="x")
+        # 注意：tk.Frame 的 widget 选项 padx/pady 在部分 Tcl/Tk 构建里
+        # 不接受 tuple（"bad screen distance" 错），所以非对称 padding
+        # 一律挪到 .pack() 上（pack/grid 的 padx/pady 是支持 tuple 的）。
+        hf = tk.Frame(c, bg=T["bg"])
+        hf.pack(fill="x", padx=30, pady=(20, 12))
         tk.Label(hf, text="⚡", font=F["emoji_s"], bg=T["bg"]).pack(side="left")
         tk.Label(hf, text="  针对性情绪方案", font=F["head"], fg=T["text_h"], bg=T["bg"]).pack(side="left")
         tk.Label(hf, text=f"共 {len(QuickDB.ITEMS)} 种情绪", font=F["small"], fg=T["text_s"], bg=T["bg"]).pack(side="right")
@@ -824,6 +837,8 @@ class MoodApp:
         for i, item in enumerate(QuickDB.ITEMS):
             AnimatedExpandCard(c, item, self.animator, delay_index=i).pack(fill="x", padx=28, pady=4)
         tk.Frame(c, bg=T["bg"], height=30).pack(fill="x")
+        # 同上：成功后才标记已渲染
+        self.page_quick._rendered = True
 
     def _animate_loading(self):
         symbols = ["◐", "◓", "◑", "◒"]
