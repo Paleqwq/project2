@@ -320,16 +320,58 @@ class SmoothScrollContainer(tk.Frame):
         self.scroll_velocity = 0
         self.is_scrolling = False
         self._rendered = False
+        self._syncing = False
         self.canvas = tk.Canvas(self, bg=T["bg"], highlightthickness=0, bd=0)
         self.inner = tk.Frame(self.canvas, bg=T["bg"])
         self.inner.bind("<Configure>", self._on_frame_configure)
         self.canvas_win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
         self.canvas.pack(side="left", fill="both", expand=True)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
+        # 冗余：把 <Configure> 也绑在外层 Frame 与 <Map> 上。
+        # PyInstaller 封包后 canvas 自身的 <Configure> 不一定及时触发，
+        # 外层 Frame 的 <Configure> 与首次 <Map> 是更可靠的尺寸信号。
+        self.bind("<Configure>", self._on_self_configure)
+        self.bind("<Map>", self._on_self_configure)
         # 使用 bind 而非 bind_all，避免多实例时全局绑定互相覆盖
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.inner.bind("<MouseWheel>", self._on_mousewheel)
         self.bind("<MouseWheel>", self._on_mousewheel)
+
+    def sync_inner_width(self, fallback_widths=()):
+        """显式同步 inner frame 宽度到 canvas 宽度，并刷新 scrollregion。
+        封包后 <Configure> 链路不可靠时由外部主动调用。"""
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            candidates = [
+                self.canvas.winfo_width(),
+                self.winfo_width(),
+                *fallback_widths,
+            ]
+            w = next((c for c in candidates if isinstance(c, int) and c > 1), 0)
+            if w > 1:
+                try:
+                    cur = self.canvas.itemcget(self.canvas_win, "width")
+                    cur_w = int(float(cur)) if cur else 0
+                except (tk.TclError, ValueError):
+                    cur_w = 0
+                if cur_w != w:
+                    self.canvas.itemconfig(self.canvas_win, width=w)
+            try:
+                bbox = self.canvas.bbox("all")
+                if bbox:
+                    self.canvas.configure(scrollregion=bbox)
+            except tk.TclError:
+                pass
+        except tk.TclError:
+            pass
+        finally:
+            self._syncing = False
+
+    def _on_self_configure(self, event=None):
+        # 外层 Frame 尺寸变化（含首次 Map）时，主动把宽度同步给 canvas window
+        self.sync_inner_width()
 
     def _bind_mousewheel_recursive(self, widget):
         """递归为所有子控件绑定滚轮事件"""
@@ -654,6 +696,12 @@ class MoodApp:
         self._init_content()
         self._init_nav()
         self._init_footer()
+        # 预渲染：把两个页面的内容在 init 阶段就构建好。
+        # 即便 PyInstaller 封包后 Canvas <Configure> 事件链不可靠，
+        # 内容的 widget 也已经存在；切换页面后只需要把宽度对齐到 canvas 即可。
+        # 这一步对解决"封包后点击快捷调节看不到心情卡片"非常关键。
+        self._render_weather()
+        self._render_quick()
         self._refresh_weather()
         self._start_ambient()
 
@@ -689,28 +737,44 @@ class MoodApp:
         if idx == 0:
             self.page_quick.pack_forget()
             self.page_weather.pack(fill="both", expand=True)
-            self.root.update_idletasks()  # 让 Canvas 完成 layout
-            self._render_weather()
-            self._refresh_scroll(self.page_weather)
+            target = self.page_weather
+            render_fn = self._render_weather
         else:
             self.page_weather.pack_forget()
             self.page_quick.pack(fill="both", expand=True)
-            self.root.update_idletasks()  # 让 Canvas 完成 layout
-            self._render_quick()
-            self._refresh_scroll(self.page_quick)
+            target = self.page_quick
+            render_fn = self._render_quick
+        # 关键修复（封包后点击快捷调节空白）：
+        # 1) 用 update() 而非 update_idletasks()，确保 <Configure> 事件被派发
+        #    而不仅仅是 idle 任务被处理。这是切换页面时 canvas 拿到真实宽度的前提。
+        # 2) 渲染（首次切换时才会真正建 widget；预渲染过则是 no-op）。
+        # 3) 立即同步一次宽度 + 多次延迟兜底刷新，应对封包后的尺寸事件抖动。
+        try:
+            self.root.update()
+        except tk.TclError:
+            pass
+        render_fn()
+        self._refresh_scroll(target)
+        self.root.after(0, lambda: self._refresh_scroll(target))
+        self.root.after(50, lambda: self._refresh_scroll(target))
+        self.root.after(150, lambda: self._refresh_scroll(target))
 
     def _refresh_scroll(self, container):
         """强制刷新滚动容器的 inner 宽度和 scrollregion，
-        修复封包后 <Configure> 事件链不可靠导致内容不显示的问题"""
+        修复封包后 <Configure> 事件链不可靠导致内容不显示的问题。
+        多重宽度回退，避免 canvas.winfo_width() 还是 1 时静默不刷新。"""
+        if not container.winfo_exists():
+            return
         try:
             container.update_idletasks()
-            canvas_w = container.canvas.winfo_width()
-            if canvas_w > 1:
-                container.canvas.itemconfig(container.canvas_win, width=canvas_w)
-            container.update_idletasks()
-            container.canvas.configure(scrollregion=container.canvas.bbox("all"))
         except tk.TclError:
-            pass
+            return
+        fallbacks = []
+        if hasattr(self, "main_container") and self.main_container.winfo_exists():
+            fallbacks.append(self.main_container.winfo_width())
+        if self.root.winfo_exists():
+            fallbacks.append(self.root.winfo_width())
+        container.sync_inner_width(tuple(fallbacks))
 
     def _render_weather(self):
         c = self.page_weather.inner
