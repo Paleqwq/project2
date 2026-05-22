@@ -903,7 +903,21 @@ class MoodWheel(tk.Frame):
 
 
 class WheelResultDialog(tk.Toplevel):
-    """🎉 心情转盘结果弹窗 - 展示选中项 + 详细做法。"""
+    """🎉 心情转盘结果弹窗 - 展示选中项 + 详细做法。
+
+    布局尺寸说明（修复『边框遮挡文字』）：
+    - 弹窗整体放大到 600 x 500，给长描述留足竖向空间；
+    - 描述卡片 `desc_frame.pack(padx=OUTER)` + `desc_frame(padx=INNER)`，
+      `wraplength` 必须 ≤ 可用宽度，否则换行后每行右端会被内边框/内 padding
+      盖住，看起来就像「文字被边框吃了」。
+        可用宽度 = 600 - 2*OUTER - 2*INNER - 2*highlightthickness
+    """
+
+    # 几何参数集中放，调整尺寸只改一处
+    DIALOG_W = 600
+    DIALOG_H = 500
+    OUTER_PAD = 36   # desc 卡片与窗口边缘的距离
+    INNER_PAD = 22   # desc 卡片内部 padding
 
     def __init__(self, parent, icon, title, desc):
         super().__init__(parent)
@@ -917,7 +931,11 @@ class WheelResultDialog(tk.Toplevel):
         except tk.TclError:
             pass
 
-        w, h = 440, 360
+        w, h = self.DIALOG_W, self.DIALOG_H
+        # 计算 wraplength：留 4px 安全余量给字体 metrics 的舍入误差，
+        # 避免最后一个汉字偶发性贴边
+        wraplength = w - 2 * self.OUTER_PAD - 2 * self.INNER_PAD - 2 - 4
+
         self.geometry(f"{w}x{h}")
         # 居中到父窗口
         try:
@@ -928,29 +946,34 @@ class WheelResultDialog(tk.Toplevel):
         except tk.TclError:
             pass
 
-        # 顶部装饰条
-        tk.Frame(self, bg=T["prim"], height=6).pack(fill="x")
+        # 顶部装饰条（稍加厚一点，更显眼）
+        tk.Frame(self, bg=T["prim"], height=8).pack(fill="x")
 
         # 图标 + 标题
-        tk.Label(self, text=icon, font=("Segoe UI Emoji", 52),
-                 bg=T["card"]).pack(pady=(22, 4))
+        tk.Label(self, text=icon, font=("Segoe UI Emoji", 60),
+                 bg=T["card"]).pack(pady=(28, 6))
         tk.Label(self, text=title, font=F["title"],
                  fg=T["text_h"], bg=T["card"]).pack()
         tk.Label(self, text="✨  转盘为你选定", font=F["small"],
-                 fg=T["text_s"], bg=T["card"]).pack(pady=(4, 14))
+                 fg=T["text_s"], bg=T["card"]).pack(pady=(6, 18))
 
-        # 描述卡片
-        desc_frame = tk.Frame(self, bg=T["prim_l"], padx=20, pady=16,
-                              highlightthickness=1, highlightbackground=T["prim_light"])
-        desc_frame.pack(fill="x", padx=26)
-        tk.Label(desc_frame, text=desc, font=F["body"], fg=T["text_b"],
-                 bg=T["prim_l"], wraplength=360, justify="left").pack(anchor="w")
+        # 描述卡片：使用 subtitle 字号让长描述更清楚易读
+        desc_frame = tk.Frame(
+            self, bg=T["prim_l"],
+            padx=self.INNER_PAD, pady=self.INNER_PAD,
+            highlightthickness=1, highlightbackground=T["prim_light"],
+        )
+        desc_frame.pack(fill="x", padx=self.OUTER_PAD)
+        tk.Label(
+            desc_frame, text=desc, font=F["subtitle"], fg=T["text_b"],
+            bg=T["prim_l"], wraplength=wraplength, justify="left",
+        ).pack(anchor="w", fill="x")
 
         # 关闭按钮
-        btn = tk.Label(self, text="知道了，去做这件事", font=F["body"],
-                       bg=T["prim"], fg=T["white"], padx=30, pady=10,
+        btn = tk.Label(self, text="知道了，去做这件事", font=F["head"],
+                       bg=T["prim"], fg=T["white"], padx=36, pady=12,
                        cursor="hand2")
-        btn.pack(pady=(20, 22))
+        btn.pack(pady=(24, 26))
         btn.bind("<Button-1>", lambda e: self.destroy())
         btn.bind("<Enter>", lambda e: btn.config(bg=T["prim_dark"]))
         btn.bind("<Leave>", lambda e: btn.config(bg=T["prim"]))
