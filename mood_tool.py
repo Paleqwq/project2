@@ -5,9 +5,10 @@
 1. 动画引擎：平滑展开/收起、淡入淡出、呼吸光效
 2. 悬停交互：卡片悬停发光、颜色渐变过渡
 3. 现代视觉：渐变头部、柔和配色、层次分明
-4. 流畅滚动：惯性滚动、平滑滚轮
+4. 流畅滚动：惯性滚动、平滑滚轮 + 可拖拽滑块
 5. 微交互：交错入场、状态切换动画、加载指示
-6. 保留全部 v3.7 功能：多源定位、SSL兼容、WeatherTipsDB、离线建议
+6. 心情转盘：5 选 1 等概率随机决策（喝茶 / 站起 / 刷手机 / 运动 / 零食）
+7. 保留全部 v3.7 功能：多源定位、SSL兼容、WeatherTipsDB、离线建议
 """
 
 import os
@@ -15,6 +16,7 @@ import sys
 import ssl
 import threading
 import math
+import random
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -719,6 +721,246 @@ class AnimatedExpandCard(tk.Frame):
         self._animating = False
 
 
+class MoodWheel(tk.Frame):
+    """🎡 心情转盘 - 五个等概率选项的随机决策转盘
+
+    设计要点：
+    - 五等分扇形（每片 72°），五种主题色对应五个选项；
+    - 顶部三角指针固定不动，扇形整体绕中心旋转；
+    - 旋转用 ease_out_cubic 缓动 + 至少 5 圈整圈，模拟物理减速；
+    - 每个选项概率严格等于 1/5（random.randint 决定目标扇区，不是
+      凭最终角度反推，避免浮点误差导致的概率偏差）；
+    - 落定后弹出 WheelResultDialog 给出具体说明。
+    """
+
+    OPTIONS = [
+        ("🍵", "喝一杯茶",
+         "泡一杯热茶，给自己 5 分钟无目的地慢慢喝。温热感会激活副交感神经，"
+         "让心跳变慢、肩膀松下来，是性价比极高的小型暂停。"),
+        ("🪑", "站起来休息一会",
+         "起身走 2 分钟，远眺窗外或做几个简单拉伸。每小时离开座位一次，"
+         "眼睛、脊柱和情绪都会明显变好。"),
+        ("📱", "刷 10 分钟手机",
+         "给自己一个明确的 10 分钟窗口，刷完就放下。比『偷偷刷』更有掌控感，"
+         "也不用背负罪恶感，是合法的小奖励。"),
+        ("🏃", "去运动一下",
+         "做 3 组 10 个深蹲，或下楼快走 10 分钟。运动是最划算的情绪药，"
+         "5 分钟内就能把心率和心情同时拉起来。"),
+        ("🍪", "吃点小零食",
+         "拿一份你喜欢的零食，专心吃完它。把注意力交给一件具体的小事，"
+         "可以暂时切断焦虑回路，给大脑一个『现在很好』的信号。"),
+    ]
+
+    SECTOR_COLORS = [
+        "#FCA5A5",  # 茶 - 暖红
+        "#FCD34D",  # 椅 - 黄
+        "#86EFAC",  # 手机 - 绿
+        "#93C5FD",  # 运动 - 蓝
+        "#C4B5FD",  # 零食 - 紫
+    ]
+
+    def __init__(self, parent, animator):
+        super().__init__(parent, bg=T["bg"])
+        self.animator = animator
+        self.angle = 0.0       # 当前旋转角度（度）
+        self.spinning = False
+        self.canvas_size = 360
+
+        # ---- 标题区 ----
+        head = tk.Frame(self, bg=T["bg"])
+        head.pack(fill="x", padx=30, pady=(20, 12))
+        tk.Label(head, text="🎡", font=F["emoji_s"], bg=T["bg"]).pack(side="left")
+        tk.Label(head, text="  转一下，让随机替你做决定", font=F["head"],
+                 fg=T["text_h"], bg=T["bg"]).pack(side="left")
+        tk.Label(head, text=f"共 {len(self.OPTIONS)} 个选项 · 等概率",
+                 font=F["small"], fg=T["text_s"], bg=T["bg"]).pack(side="right")
+        tk.Frame(self, bg=T["border"], height=1).pack(fill="x", padx=30, pady=(0, 16))
+
+        tk.Label(self, text="不知道现在该做什么？让转盘替你决定。",
+                 font=F["body"], fg=T["text_b"], bg=T["bg"]).pack(pady=(0, 12))
+
+        # ---- 转盘画布 ----
+        self.canvas = tk.Canvas(
+            self, width=self.canvas_size, height=self.canvas_size + 24,
+            bg=T["bg"], highlightthickness=0, bd=0,
+        )
+        self.canvas.pack(pady=(4, 6))
+        self._draw_wheel()
+
+        # ---- 结果提示行 ----
+        self.result_label = tk.Label(
+            self, text="点击下方按钮，让转盘开始旋转 ✨",
+            font=F["body"], fg=T["text_s"], bg=T["bg"],
+        )
+        self.result_label.pack(pady=(8, 8))
+
+        # ---- 旋转按钮 ----
+        self.btn = tk.Label(
+            self, text="🎲   开始旋转   🎲", font=F["head"],
+            bg=T["prim"], fg=T["white"], padx=44, pady=14,
+            cursor="hand2",
+        )
+        self.btn.pack(pady=(8, 24))
+        self.btn.bind("<Button-1>", lambda e: self.spin())
+        self.btn.bind("<Enter>", lambda e: self._btn_hover(True))
+        self.btn.bind("<Leave>", lambda e: self._btn_hover(False))
+
+    def _btn_hover(self, entering):
+        if self.spinning:
+            return
+        self.btn.config(bg=T["prim_dark"] if entering else T["prim"])
+
+    def _draw_wheel(self):
+        """根据当前 self.angle 重绘整张转盘（扇形 + 文字 + 中心 + 指针）。"""
+        self.canvas.delete("all")
+        size = self.canvas_size
+        cx, cy = size // 2, size // 2 + 12   # 给顶部指针留 12px
+        r = size // 2 - 18
+
+        n = len(self.OPTIONS)
+        sector_angle = 360 / n
+
+        for i, (icon, title, _) in enumerate(self.OPTIONS):
+            start = self.angle + i * sector_angle
+            color = self.SECTOR_COLORS[i % len(self.SECTOR_COLORS)]
+            # 扇形
+            self.canvas.create_arc(
+                cx - r, cy - r, cx + r, cy + r,
+                start=start, extent=sector_angle,
+                fill=color, outline=T["white"], width=3,
+                style="pieslice",
+            )
+            # 文字（图标在外圈、标题更靠内一点）
+            mid = math.radians(start + sector_angle / 2)
+            tx = cx + (r * 0.66) * math.cos(mid)
+            ty = cy - (r * 0.66) * math.sin(mid)
+            self.canvas.create_text(tx, ty - 14, text=icon,
+                                    font=("Segoe UI Emoji", 22))
+            self.canvas.create_text(tx, ty + 14, text=title,
+                                    font=F["small"], fill=T["text_h"])
+
+        # 中心圆盘
+        cr = 28
+        self.canvas.create_oval(cx - cr, cy - cr, cx + cr, cy + cr,
+                                fill=T["white"], outline=T["prim"], width=3)
+        self.canvas.create_text(cx, cy, text="🎯",
+                                font=("Segoe UI Emoji", 22))
+
+        # 顶部指针（三角形朝下，指向 12 点钟方向）
+        self.canvas.create_polygon(
+            cx - 16, 4, cx + 16, 4, cx, 36,
+            fill=T["prim_dark"], outline=T["white"], width=2,
+        )
+
+    def spin(self):
+        if self.spinning:
+            return
+        self.spinning = True
+        self.btn.config(bg=T["text_s"], text="🌀   旋转中...")
+        self.result_label.config(text="🌀  转盘正在为你挑选...", fg=T["prim"])
+
+        n = len(self.OPTIONS)
+        sector_angle = 360 / n
+
+        # 关键：先用 randint 等概率选目标扇区，再据此计算落点角度。
+        # 这样保证概率严格 1/5，不会因浮点最终角度落在边界上偏倚。
+        target_idx = random.randint(0, n - 1)
+
+        # tk Canvas 的 arc 角度：0° 在 3 点钟方向，逆时针为正。
+        # 顶部指针位于 90°；要让扇区 i 的中心落在 90°：
+        #   self.angle + i*sector_angle + sector_angle/2 ≡ 90  (mod 360)
+        target_base = (90 - target_idx * sector_angle - sector_angle / 2) % 360
+
+        # 至少 5 圈整圈 + 落到目标，确保视觉上有「真的转过」的感觉。
+        extra_rotations = 5
+        current = self.angle % 360
+        delta = (target_base - current) % 360 + extra_rotations * 360
+
+        start_angle = self.angle
+        end_angle = self.angle + delta
+
+        def _update(p):
+            self.angle = start_angle + (end_angle - start_angle) * p
+            self._draw_wheel()
+
+        def _done():
+            self.angle = end_angle
+            self._draw_wheel()
+            self.spinning = False
+            self.btn.config(bg=T["prim"], text="🎲   再转一次   🎲")
+            self._show_result(target_idx)
+
+        # 3 秒 + ease_out_cubic：开头快、末尾慢慢停下，物理感更强
+        self.animator.animate(3000, _update, on_complete=_done,
+                              easing=AnimationEngine.ease_out_cubic)
+
+    def _show_result(self, idx):
+        icon, title, desc = self.OPTIONS[idx]
+        self.result_label.config(
+            text=f"✨ 转盘选中：{icon}  {title}", fg=T["prim_dark"],
+        )
+        WheelResultDialog(self.winfo_toplevel(), icon, title, desc)
+
+
+class WheelResultDialog(tk.Toplevel):
+    """🎉 心情转盘结果弹窗 - 展示选中项 + 详细做法。"""
+
+    def __init__(self, parent, icon, title, desc):
+        super().__init__(parent)
+        self.title("✨ 转盘结果")
+        self.configure(bg=T["card"])
+        self.resizable(False, False)
+        # 模态：阻塞在父窗口上，避免连续乱点旋转
+        self.transient(parent)
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
+
+        w, h = 440, 360
+        self.geometry(f"{w}x{h}")
+        # 居中到父窗口
+        try:
+            self.update_idletasks()
+            px = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
+            py = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
+            self.geometry(f"{w}x{h}+{max(px, 0)}+{max(py, 0)}")
+        except tk.TclError:
+            pass
+
+        # 顶部装饰条
+        tk.Frame(self, bg=T["prim"], height=6).pack(fill="x")
+
+        # 图标 + 标题
+        tk.Label(self, text=icon, font=("Segoe UI Emoji", 52),
+                 bg=T["card"]).pack(pady=(22, 4))
+        tk.Label(self, text=title, font=F["title"],
+                 fg=T["text_h"], bg=T["card"]).pack()
+        tk.Label(self, text="✨  转盘为你选定", font=F["small"],
+                 fg=T["text_s"], bg=T["card"]).pack(pady=(4, 14))
+
+        # 描述卡片
+        desc_frame = tk.Frame(self, bg=T["prim_l"], padx=20, pady=16,
+                              highlightthickness=1, highlightbackground=T["prim_light"])
+        desc_frame.pack(fill="x", padx=26)
+        tk.Label(desc_frame, text=desc, font=F["body"], fg=T["text_b"],
+                 bg=T["prim_l"], wraplength=360, justify="left").pack(anchor="w")
+
+        # 关闭按钮
+        btn = tk.Label(self, text="知道了，去做这件事", font=F["body"],
+                       bg=T["prim"], fg=T["white"], padx=30, pady=10,
+                       cursor="hand2")
+        btn.pack(pady=(20, 22))
+        btn.bind("<Button-1>", lambda e: self.destroy())
+        btn.bind("<Enter>", lambda e: btn.config(bg=T["prim_dark"]))
+        btn.bind("<Leave>", lambda e: btn.config(bg=T["prim"]))
+
+        # Esc 关闭，并主动获取焦点
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.focus_force()
+
+
 class GradientHeader(tk.Canvas):
     """渐变色头部"""
     def __init__(self, parent, height=130):
@@ -843,6 +1085,10 @@ class MoodApp:
             self._render_quick()
         except Exception as e:
             sys.stderr.write(f"[mood_tool] eager render quick failed: {e!r}\n")
+        try:
+            self._render_wheel()
+        except Exception as e:
+            sys.stderr.write(f"[mood_tool] eager render wheel failed: {e!r}\n")
         self._refresh_weather()
         self._start_ambient()
 
@@ -854,9 +1100,10 @@ class MoodApp:
         self.main_container.pack(fill="both", expand=True)
         self.page_weather = SmoothScrollContainer(self.main_container, self.animator)
         self.page_quick = SmoothScrollContainer(self.main_container, self.animator)
+        self.page_wheel = SmoothScrollContainer(self.main_container, self.animator)
 
     def _init_nav(self):
-        tabs = [("🌤", "天气建议"), ("⚡", "快捷调节")]
+        tabs = [("🌤", "天气建议"), ("⚡", "快捷调节"), ("🎡", "心情转盘")]
         self.navbar = AnimatedNavBar(self.root, tabs, self._switch_page, self.animator)
         self.navbar.pack(fill="x")
         self._switch_page(0)
@@ -875,16 +1122,18 @@ class MoodApp:
                 font=F["tiny"], fg=T["text_s"], bg=T["border_light"]).pack(side="right", padx=20, pady=6)
 
     def _switch_page(self, idx):
-        if idx == 0:
-            self.page_quick.pack_forget()
-            self.page_weather.pack(fill="both", expand=True)
-            target = self.page_weather
-            render_fn = self._render_weather
-        else:
-            self.page_weather.pack_forget()
-            self.page_quick.pack(fill="both", expand=True)
-            target = self.page_quick
-            render_fn = self._render_quick
+        # 三页用列表统一管理，避免 if/else 分支随页面增加而膨胀
+        pages = [
+            (self.page_weather, self._render_weather),
+            (self.page_quick,   self._render_quick),
+            (self.page_wheel,   self._render_wheel),
+        ]
+        # 先把其它页面收起，再把当前页 pack 到主容器里
+        for i, (p, _) in enumerate(pages):
+            if i != idx:
+                p.pack_forget()
+        target, render_fn = pages[idx]
+        target.pack(fill="both", expand=True)
         # 关键修复（封包后点击快捷调节空白）：
         # 1) 用 update() 而非 update_idletasks()，确保 <Configure> 事件被派发
         #    而不仅仅是 idle 任务被处理。这是切换页面时 canvas 拿到真实宽度的前提。
@@ -974,6 +1223,17 @@ class MoodApp:
         tk.Frame(c, bg=T["bg"], height=30).pack(fill="x")
         # 同上：成功后才标记已渲染
         self.page_quick._rendered = True
+
+    def _render_wheel(self):
+        c = self.page_wheel.inner
+        if self.page_wheel._rendered:
+            return
+        # 心情转盘：把整个 MoodWheel 居中放进滚动容器
+        wheel = MoodWheel(c, self.animator)
+        wheel.pack(anchor="center", pady=(4, 0))
+        tk.Frame(c, bg=T["bg"], height=30).pack(fill="x")
+        # 同上：成功后才标记已渲染
+        self.page_wheel._rendered = True
 
     def _animate_loading(self):
         symbols = ["◐", "◓", "◑", "◒"]
