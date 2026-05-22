@@ -319,21 +319,39 @@ class SmoothScrollContainer(tk.Frame):
         self.animator = animator
         self.scroll_velocity = 0
         self.is_scrolling = False
+        self._rendered = False
         self.canvas = tk.Canvas(self, bg=T["bg"], highlightthickness=0, bd=0)
         self.inner = tk.Frame(self.canvas, bg=T["bg"])
         self.inner.bind("<Configure>", self._on_frame_configure)
         self.canvas_win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
         self.canvas.pack(side="left", fill="both", expand=True)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        # 使用 bind 而非 bind_all，避免多实例时全局绑定互相覆盖
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.inner.bind("<MouseWheel>", self._on_mousewheel)
+        self.bind("<MouseWheel>", self._on_mousewheel)
+
+    def _bind_mousewheel_recursive(self, widget):
+        """递归为所有子控件绑定滚轮事件"""
+        try:
+            widget.bind("<MouseWheel>", self._on_mousewheel)
+            for child in widget.winfo_children():
+                self._bind_mousewheel_recursive(child)
+        except tk.TclError:
+            pass
 
     def _on_frame_configure(self, event):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        # 每次 inner frame 变化时，重新绑定所有子控件的滚轮
+        self._bind_mousewheel_recursive(self.inner)
 
     def _on_canvas_configure(self, event):
         self.canvas.itemconfig(self.canvas_win, width=event.width)
 
     def _on_mousewheel(self, event):
+        # 仅在当前容器可见时处理滚轮
+        if not self.winfo_ismapped():
+            return
         self.scroll_velocity = -event.delta / 40.0
         if not self.is_scrolling:
             self.is_scrolling = True
@@ -349,28 +367,150 @@ class SmoothScrollContainer(tk.Frame):
             self.after(16, self._inertia_scroll)
 
 
+class RoundedFrame(tk.Canvas):
+    """圆角卡片容器 — 用 Canvas 绘制圆角矩形背景"""
+    def __init__(self, parent, bg_color=None, radius=16, border_color=None,
+                 border_width=2, **kwargs):
+        bg_color = bg_color or T["card"]
+        border_color = border_color or T["border_light"]
+        super().__init__(parent, highlightthickness=0, bd=0,
+                         bg=parent.cget("bg") if hasattr(parent, 'cget') else T["bg"], **kwargs)
+        self.radius = radius
+        self._bg_color = bg_color
+        self._border_color = border_color
+        self._border_width = border_width
+        self._inner = tk.Frame(self, bg=bg_color)
+        self._inner_win = None
+        self.bind("<Configure>", self._redraw)
+
+    @property
+    def inner(self):
+        return self._inner
+
+    def _round_rect(self, x1, y1, x2, y2, r, **kwargs):
+        """绘制圆角矩形"""
+        points = [
+            x1+r, y1, x1+r, y1, x2-r, y1, x2-r, y1,
+            x2, y1, x2, y1+r, x2, y1+r, x2, y2-r,
+            x2, y2-r, x2, y2, x2-r, y2, x2-r, y2,
+            x1+r, y2, x1+r, y2, x1, y2, x1, y2-r,
+            x1, y2-r, x1, y1+r, x1, y1+r, x1, y1,
+        ]
+        return self.create_polygon(points, smooth=True, **kwargs)
+
+    def _redraw(self, event=None):
+        self.delete("bg")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        bw = self._border_width
+        # 绘制边框圆角矩形
+        self._round_rect(bw//2, bw//2, w-bw//2, h-bw//2, self.radius,
+                         fill=self._bg_color, outline=self._border_color,
+                         width=bw, tags="bg")
+        # 将 inner frame 放在 canvas 上
+        if self._inner_win is None:
+            self._inner_win = self.create_window(bw+4, bw+4, window=self._inner,
+                                                  anchor="nw", tags="content")
+        # 调整 inner frame 大小
+        inner_w = max(w - 2*bw - 8, 1)
+        inner_h = max(h - 2*bw - 8, 1)
+        self.itemconfig(self._inner_win, width=inner_w)
+        self.tag_raise("content")
+
+    def set_border_color(self, color):
+        self._border_color = color
+        self._redraw()
+
+
 class GlowCard(tk.Frame):
-    """带悬停发光效果的卡片"""
-    def __init__(self, parent, animator, glow_color=None):
-        super().__init__(parent, bg=T["card"], bd=0,
-                         highlightthickness=2, highlightbackground=T["border_light"])
+    """带悬停发光效果的圆角卡片（Canvas 圆角矩形背景）"""
+    def __init__(self, parent, animator, glow_color=None, radius=14):
+        parent_bg = T["bg"]
+        try:
+            parent_bg = parent.cget("bg")
+        except Exception:
+            pass
+        super().__init__(parent, bg=parent_bg, bd=0, highlightthickness=0)
         self.animator = animator
         self.glow_color = glow_color or T["glow"]
+        self.radius = radius
+        self._current_border = T["border_light"]
+        self._parent_bg = parent_bg
+
+        # Canvas 作为圆角背景层
+        self._canvas = tk.Canvas(self, highlightthickness=0, bd=0, bg=parent_bg)
+        self._canvas.pack(fill="both", expand=True)
+
+        # 内部内容 frame
+        self._inner = tk.Frame(self._canvas, bg=T["card"], bd=0)
+        self._inner_win = self._canvas.create_window(6, 6, window=self._inner, anchor="nw")
+
+        # 当内部内容大小变化时，更新 Canvas 大小
+        self._inner.bind("<Configure>", self._on_inner_configure)
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
+
         self.bind("<Enter>", lambda e: self._animate_hover(True))
         self.bind("<Leave>", lambda e: self._animate_hover(False))
+        self._canvas.bind("<Enter>", lambda e: self._animate_hover(True))
+        self._canvas.bind("<Leave>", lambda e: self._animate_hover(False))
+        self._inner.bind("<Enter>", lambda e: self._animate_hover(True))
+        self._inner.bind("<Leave>", lambda e: self._animate_hover(False))
+
+    def pack_content(self):
+        """返回内部 frame 供外部添加内容"""
+        return self._inner
+
+    def _on_inner_configure(self, event):
+        """内部内容改变时，调整 Canvas 最小高度"""
+        req_w = self._inner.winfo_reqwidth()
+        req_h = self._inner.winfo_reqheight()
+        # Canvas 需要比 inner 大一圈（留出边框空间）
+        self._canvas.configure(height=req_h + 12, width=req_w + 12)
+        self._redraw()
+
+    def _on_canvas_configure(self, event):
+        """Canvas 大小变化时重绘圆角与调整 inner 宽度"""
+        w = event.width
+        if w > 12:
+            self._canvas.itemconfig(self._inner_win, width=w - 12)
+        self._redraw()
+
+    def _round_rect(self, x1, y1, x2, y2, r, **kwargs):
+        points = [
+            x1+r, y1, x1+r, y1, x2-r, y1, x2-r, y1,
+            x2, y1, x2, y1+r, x2, y1+r, x2, y2-r,
+            x2, y2-r, x2, y2, x2-r, y2, x2-r, y2,
+            x1+r, y2, x1+r, y2, x1, y2, x1, y2-r,
+            x1, y2-r, x1, y1+r, x1, y1+r, x1, y1,
+        ]
+        return self._canvas.create_polygon(points, smooth=True, **kwargs)
+
+    def _redraw(self, event=None):
+        self._canvas.delete("bg")
+        w = self._canvas.winfo_width()
+        h = self._canvas.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        self._round_rect(1, 1, w-1, h-1, self.radius,
+                         fill=T["card"], outline=self._current_border,
+                         width=2, tags="bg")
+        self._canvas.tag_raise(self._inner_win)
 
     def _animate_hover(self, entering):
-        start = T["border_light"] if entering else self.glow_color
+        start_color = self._current_border
         end = self.glow_color if entering else T["border_light"]
         def _update(progress):
-            color = Animator._lerp_color(start, end, progress)
-            try: self.configure(highlightbackground=color)
+            color = Animator._lerp_color(start_color, end, progress)
+            self._current_border = color
+            try: self._redraw()
             except tk.TclError: pass
         self.animator.animate(250, _update, easing=AnimationEngine.ease_out_expo)
 
 
 class AnimatedExpandCard(tk.Frame):
-    """带动画展开效果的情绪方案卡片"""
+    """带动画展开效果的情绪方案卡片（圆角版）"""
     def __init__(self, parent, item_data, animator, delay_index=0):
         super().__init__(parent, bg=T["bg"])
         self.data = item_data
@@ -379,13 +519,18 @@ class AnimatedExpandCard(tk.Frame):
         self.body = None
         self._animating = False
 
-        self.card = GlowCard(self, animator, glow_color=T["prim_light"])
+        # 使用简化的圆角卡片（Frame + 圆角边框模拟）
+        self.card = tk.Frame(self, bg=T["card"], bd=0,
+                             highlightthickness=2, highlightbackground=T["border_light"])
         self.card.pack(fill="x", pady=2)
+        # 通过 configure relief + borderwidth 模拟圆角感
+        self.card.configure(relief="flat")
 
         self.header = tk.Frame(self.card, bg=T["card"], padx=24, pady=20, cursor="hand2")
         self.header.pack(fill="x")
 
-        icon_bg = tk.Frame(self.header, bg=T["prim_l"], width=52, height=52)
+        icon_bg = tk.Frame(self.header, bg=T["prim_l"], width=52, height=52,
+                           highlightthickness=0)
         icon_bg.pack(side="left", padx=(0, 18))
         icon_bg.pack_propagate(False)
         icon_lbl = tk.Label(icon_bg, text=item_data["icon"], font=F["emoji_m"], bg=T["prim_l"])
@@ -411,6 +556,8 @@ class AnimatedExpandCard(tk.Frame):
         self.after(delay_index * 80, self._entrance)
 
     def _entrance(self):
+        if not self.winfo_exists():
+            return
         def _update(p):
             color = Animator._lerp_color(T["bg"], T["border_light"], p)
             try: self.card.configure(highlightbackground=color)
@@ -495,19 +642,21 @@ class GradientHeader(tk.Canvas):
 
 
 class AnimatedNavBar(tk.Frame):
-    """带动画的导航栏"""
+    """带动画的圆角导航栏"""
     def __init__(self, parent, tabs, on_switch, animator):
         super().__init__(parent, bg=T["bg"], pady=14)
         self.animator = animator
         self.on_switch = on_switch
         self.current_idx = 0
-        self.pill = tk.Frame(self, bg=T["nav_bg"], padx=4, pady=4)
+        # 圆角药丸形容器
+        self.pill = tk.Frame(self, bg=T["nav_bg"], padx=6, pady=6,
+                             highlightthickness=1, highlightbackground=T["border_light"])
         self.pill.pack(anchor="center")
         self.btns = []
         for i, (icon, name) in enumerate(tabs):
             btn = tk.Label(self.pill, text=f"{icon}  {name}", font=F["body"],
                           padx=32, pady=10, cursor="hand2", bg=T["nav_bg"], fg=T["text_s"])
-            btn.pack(side="left", padx=2)
+            btn.pack(side="left", padx=3)
             btn.bind("<Button-1>", lambda e, idx=i: self._switch_to(idx))
             btn.bind("<Enter>", lambda e, b=btn, idx=i: self._hover(b, idx, True))
             btn.bind("<Leave>", lambda e, b=btn, idx=i: self._hover(b, idx, False))
@@ -583,7 +732,8 @@ class MoodApp:
         self._switch_page(0)
 
     def _init_footer(self):
-        footer = tk.Frame(self.root, bg=T["border_light"], height=32)
+        footer = tk.Frame(self.root, bg=T["border_light"], height=32,
+                          highlightthickness=0)
         footer.pack(fill="x", side="bottom")
         footer.pack_propagate(False)
         self.status_dot = tk.Label(footer, text="●", font=F["tiny"], fg=T["success"], bg=T["border_light"])
@@ -606,12 +756,14 @@ class MoodApp:
 
     def _render_weather(self):
         c = self.page_weather.inner
-        if c.winfo_children(): return
+        if self.page_weather._rendered:
+            return
+        self.page_weather._rendered = True
 
         weather_card = GlowCard(c, self.animator, glow_color=T["accent_light"])
         weather_card.pack(fill="x", padx=30, pady=(24, 16))
-        wi = tk.Frame(weather_card, bg=T["card"], padx=36, pady=32)
-        wi.pack(fill="x")
+        wi = weather_card.pack_content()
+        wi.configure(padx=36, pady=32)
 
         self.w_icon = tk.Label(wi, text="⌛", font=F["emoji_l"], bg=T["card"])
         self.w_icon.pack(side="left")
@@ -637,7 +789,10 @@ class MoodApp:
 
     def _render_quick(self):
         c = self.page_quick.inner
-        if c.winfo_children(): return
+        if self.page_quick._rendered:
+            return
+        self.page_quick._rendered = True
+
         hf = tk.Frame(c, bg=T["bg"], padx=30, pady=(20, 12))
         hf.pack(fill="x")
         tk.Label(hf, text="⚡", font=F["emoji_s"], bg=T["bg"]).pack(side="left")
@@ -695,9 +850,7 @@ class MoodApp:
             self.status_label.config(text=f"已同步 · {res['city']} {res['desc']} {temp_text}")
             tips = WeatherTipsDB.get(res["code"], temp)
             self._populate_suggestions(tips)
-            # 脉冲效果
-            try: self.animator.pulse(self.w_icon.master.master, T["border_light"], T["accent_light"], 1000)
-            except: pass
+            # 圆角卡片不再使用 pulse（无 highlightbackground）
         else:
             self.lbl_temp.config(text="--°C", fg=T["warn"])
             self.lbl_desc.config(text="天气同步失败，已为您切换为离线建议", fg=T["warn"])
@@ -715,8 +868,8 @@ class MoodApp:
         for i, (title, desc) in enumerate(tips["items"], 1):
             card = GlowCard(self.suggest_container, self.animator, glow_color=T["prim_light"])
             card.pack(fill="x", pady=5)
-            inner = tk.Frame(card, bg=T["card"], padx=18, pady=14)
-            inner.pack(fill="x")
+            inner = card.pack_content()
+            inner.configure(padx=18, pady=14)
             num = tk.Frame(inner, bg=T["prim"], width=24, height=24)
             num.pack(side="left", padx=(0, 14))
             num.pack_propagate(False)
