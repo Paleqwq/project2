@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-情绪调节小工具 — 灵动美化版 (Fluid UI v4.1 - High-FPS Smooth)
+情绪调节小工具 — 灵动美化版 (Fluid UI v4.2 - Anti-Aliased Smooth)
 基于 fix/weather-suggestions 分支 (v3.7) 升级：
 1. 动画引擎：平滑展开/收起、淡入淡出、呼吸光效
 2. 悬停交互：卡片悬停发光、颜色渐变过渡
@@ -16,6 +16,13 @@ v4.1 流畅度专项优化（让画面过渡更顺滑、帧率更高）：
    （单帧 50+ 次 delete/create → 15 次属性改写，转盘真正"丝滑"）
  - 滚动：yview_moveto 亚像素分数滚动 + 速度累加 + 0.92 衰减，告别整行跳变
  - 呼吸光：50ms (20fps) → 16ms (~60fps)，颜色 lerp 平滑无台阶
+
+v4.2 抗锯齿专项优化（让画面更光滑，告别像素台阶）：
+ - MoodWheel：tk 的原生 create_arc 不支持抗锯齿，扇形边沿很糙；
+   改用 PIL 在 3x 超采样画面上绘制 pieslice，再 LANCZOS 下采样到显示尺寸，
+   边缘平滑度肉眼可见地提升一个档次。旋转使用 BICUBIC 重采样。
+ - 圆角卡片：splinesteps 12 → 36，圆角曲线更柔和，不再"折角"。
+ - 兜底：PIL 不可用时自动回退到原 tk 扇形渲染，不会崩。
 """
 
 import os
@@ -38,6 +45,16 @@ try:
     os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
 except Exception:
     pass
+
+# ----- 抗锯齿渲染依赖（Pillow）：可选依赖，未安装时优雅降级到 tk 原生绘制 -----
+# 思路：tk Canvas 的 create_arc / create_oval 不做抗锯齿，曲面边缘很糙。
+# 使用 PIL 在 3x 超采样画布上画好图形，再用 LANCZOS 滤波下采样到显示尺寸，
+# 借助滤波器的"加权平均"让边缘像素呈现亚像素级渐变，肉眼看上去就"光滑"了。
+try:
+    from PIL import Image, ImageDraw, ImageTk  # noqa: F401
+    _HAS_PIL = True
+except Exception:
+    _HAS_PIL = False
 
 # ============================================================
 # 🎨 现代视觉主题 - 柔和渐变配色
@@ -516,7 +533,12 @@ class RoundedFrame(tk.Canvas):
         return self._inner
 
     def _round_rect(self, x1, y1, x2, y2, r, **kwargs):
-        """绘制圆角矩形"""
+        """绘制圆角矩形
+
+        smooth=True 时 tk 用 B-spline 插值；splinesteps 默认 12，分段太少
+        会让圆角看起来"有折角"。提到 36 之后曲线明显变柔和，对性能几乎无影响
+        （只在 <Configure> 时重绘一次）。
+        """
         points = [
             x1+r, y1, x1+r, y1, x2-r, y1, x2-r, y1,
             x2, y1, x2, y1+r, x2, y1+r, x2, y2-r,
@@ -524,7 +546,7 @@ class RoundedFrame(tk.Canvas):
             x1+r, y2, x1+r, y2, x1, y2, x1, y2-r,
             x1, y2-r, x1, y1+r, x1, y1+r, x1, y1,
         ]
-        return self.create_polygon(points, smooth=True, **kwargs)
+        return self.create_polygon(points, smooth=True, splinesteps=36, **kwargs)
 
     def _redraw(self, event=None):
         self.delete("bg")
@@ -841,7 +863,14 @@ class MoodWheel(tk.Frame):
         self.spinning = False
         self.canvas_size = 360
 
-        # 旋转期间复用的 canvas item ID（避免每帧 delete+create 全部重建）
+        # 抗锯齿渲染状态：PIL 不可用时自动降级到 tk 原生绘制
+        self._use_pil = _HAS_PIL
+        self._wheel_base_pil = None     # base 图：超采样后下采样到显示尺寸（含 AA 边缘）
+        self._wheel_photo = None        # 当前帧的 ImageTk.PhotoImage —— 必须持引用，
+                                        # GC 后 tk 内部的 image 也会被销毁。
+        self._wheel_image_id = None     # canvas image item id（旋转时 itemconfig 替换）
+
+        # 旋转期间复用的 canvas item ID（avoid 每帧 delete+create 全部重建）
         self._arc_ids = []
         self._icon_ids = []
         self._title_ids = []
@@ -892,18 +921,138 @@ class MoodWheel(tk.Frame):
         self.btn.config(bg=T["prim_dark"] if entering else T["prim"])
 
     def _build_wheel(self):
-        """一次性创建所有 canvas item 并保存 ID。后续旋转用 itemconfig/coords 改属性，
-        不再 delete+create 全部，从根本上消除旋转过程中的闪烁与卡顿。"""
+        """构建转盘：根据 PIL 可用性分派到抗锯齿路径或 tk 原生路径。
+
+        共同步骤：
+        - 清空 canvas
+        - 记录中心坐标 (cx, cy) 和半径 r（其它方法都基于这个）
+        - 画扇形（PIL: 一张 AA 图；tk: 5 个 create_arc）
+        - 画文字标签（5 组 icon + title 的 canvas text）
+        - 画静态叠加层（中心圆盘、🎯 字符、顶部三角指针）
+        """
         self.canvas.delete("all")
         self._arc_ids = []
         self._icon_ids = []
         self._title_ids = []
+        self._wheel_image_id = None
 
         size = self.canvas_size
         cx, cy = size // 2, size // 2 + 12   # 给顶部指针留 12px
         r = size // 2 - 18
         self._cx, self._cy, self._r = cx, cy, r
 
+        # 扇形渲染分派
+        if self._use_pil:
+            try:
+                self._build_wheel_aa()
+            except Exception as e:
+                # PIL 异常时透明降级，保证转盘永远能用
+                sys.stderr.write(f"[mood_tool] PIL wheel render failed, falling back: {e!r}\n")
+                self._use_pil = False
+                self.canvas.delete("all")
+                self._arc_ids = []
+                self._icon_ids = []
+                self._title_ids = []
+                self._wheel_image_id = None
+                self._build_wheel_legacy()
+        else:
+            self._build_wheel_legacy()
+
+        # 静态叠加：中心圆盘 + 🎯 + 顶部指针（不随旋转变）
+        self._draw_static_overlay()
+
+    def _build_wheel_aa(self):
+        """PIL 抗锯齿路径：用一张超采样下采样的 RGBA 图代替 5 个 create_arc。
+
+        优点：边缘像素被 LANCZOS 滤波器加权平均出亚像素级渐变，
+        视觉效果由"硬阶梯锯齿"变成"丝绒般光滑"。
+        旋转时只需 Image.rotate + 重新 PhotoImage + itemconfig，单帧 ~5ms。
+        """
+        cx, cy, r = self._cx, self._cy, self._r
+        diameter = 2 * r
+
+        # 一次性构建 base 图（未旋转）。后续每帧仅旋转、不再重画扇形。
+        self._wheel_base_pil = self._render_wheel_pil_base(diameter)
+
+        # 初始角度可能为 0（首次构建）也可能不是 0（重建时保留当前角度）
+        if self.angle:
+            display_img = self._wheel_base_pil.rotate(
+                self.angle, resample=Image.BICUBIC, expand=False,
+            )
+        else:
+            display_img = self._wheel_base_pil
+
+        photo = ImageTk.PhotoImage(display_img)
+        self._wheel_image_id = self.canvas.create_image(cx, cy, image=photo)
+        # 关键：必须把 photo 挂到 self 上。tkinter 不会增加 Python 引用计数，
+        # 一旦 PhotoImage 对象被 GC，其底层的 tk 图也随之销毁，canvas 上就空了。
+        self._wheel_photo = photo
+
+        # 文字标签依然用 canvas text（freetype 已天然抗锯齿，无须 PIL）。
+        # 旋转时只需 update coords，不必重建 widget。
+        n = len(self.OPTIONS)
+        sector_angle = 360 / n
+        text_r = r * 0.66
+        for i, (icon, title, _) in enumerate(self.OPTIONS):
+            start = self.angle + i * sector_angle
+            mid = math.radians(start + sector_angle / 2)
+            tx = cx + text_r * math.cos(mid)
+            ty = cy - text_r * math.sin(mid)
+            icon_id = self.canvas.create_text(
+                tx, ty - 14, text=icon, font=("Segoe UI Emoji", 22),
+            )
+            title_id = self.canvas.create_text(
+                tx, ty + 14, text=title, font=F["small"], fill=T["text_h"],
+            )
+            self._icon_ids.append(icon_id)
+            self._title_ids.append(title_id)
+
+    @classmethod
+    def _render_wheel_pil_base(cls, diameter):
+        """生成 wheel 的抗锯齿 base 图（未旋转，转盘正面朝向 0°）。
+
+        关键算法：
+        1. 在 3x 超采样画布（大 9 倍像素）上画 pieslice —— 大画布上锯齿就是
+           子像素级的细锯齿；
+        2. 用 LANCZOS（窗口 sinc）滤波下采样回 1x —— 滤波器把多个超采样像素
+           加权平均成一个目标像素，边缘自然出现亚像素级渐变。
+        3. PIL 的 pieslice 角度约定与 tk arc 相反（PIL CW，tk CCW）；
+           画完后 vertical flip 一下就对齐了，比改 angle 算式更直观。
+
+        坐标约定：base 图里 self.angle = 0 时，sector 0（茶）的起始边在 3 点钟方向，
+        与 tk arc start=0 的位置一致；后续 Image.rotate(angle, ...) 也是 CCW，
+        正好对应 tk arc 的 start += angle 行为。
+        """
+        SS = 3                                       # 超采样倍数
+        big = diameter * SS
+        img = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        n = len(cls.OPTIONS)
+        sector_angle = 360.0 / n
+        bbox = (0, 0, big - 1, big - 1)
+        outline_w = max(1, 3 * SS)
+        white = (255, 255, 255, 255)
+
+        for i in range(n):
+            start = i * sector_angle
+            end = start + sector_angle
+            color_hex = cls.SECTOR_COLORS[i % len(cls.SECTOR_COLORS)]
+            rgb = tuple(int(color_hex[j:j+2], 16) for j in (1, 3, 5))
+            draw.pieslice(
+                bbox, start, end,
+                fill=rgb + (255,), outline=white, width=outline_w,
+            )
+
+        # PIL 的 CW 翻成 tk arc 的 CCW
+        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+
+        # LANCZOS 下采样：超采样 + 高质量重采样 = 抗锯齿
+        return img.resize((diameter, diameter), Image.LANCZOS)
+
+    def _build_wheel_legacy(self):
+        """tk 原生扇形渲染（PIL 不可用时的兜底，视觉上有锯齿）。"""
+        cx, cy, r = self._cx, self._cy, self._r
         n = len(self.OPTIONS)
         sector_angle = 360 / n
 
@@ -927,13 +1076,14 @@ class MoodWheel(tk.Frame):
             self._icon_ids.append(icon_id)
             self._title_ids.append(title_id)
 
-        # 中心圆盘（静态，不随旋转变）
+    def _draw_static_overlay(self):
+        """中心圆盘 + 🎯 + 顶部三角指针：不随旋转变，画在 wheel 之上。"""
+        cx, cy = self._cx, self._cy
         cr = 28
         self.canvas.create_oval(cx - cr, cy - cr, cx + cr, cy + cr,
                                 fill=T["white"], outline=T["prim"], width=3)
         self.canvas.create_text(cx, cy, text="🎯",
                                 font=("Segoe UI Emoji", 22))
-
         # 顶部指针（静态）
         self.canvas.create_polygon(
             cx - 16, 4, cx + 16, 4, cx, 36,
@@ -941,9 +1091,53 @@ class MoodWheel(tk.Frame):
         )
 
     def _update_wheel_rotation(self):
-        """高频热路径：仅更新随旋转变化的属性，单帧约 15 次属性改写，
-        相比原 _draw_wheel 的 50+ 次 delete/create 调用，开销下降一个数量级，
-        是让转盘"真的转得起来"的关键。"""
+        """高频热路径：仅更新随旋转变化的属性。
+
+        AA 路径单帧成本估算：
+          Image.rotate (BICUBIC, 324x324) ≈ 3-5 ms
+          ImageTk.PhotoImage 构造        ≈ 1-2 ms
+          itemconfig + 5*coords          ≈ <1 ms
+          合计 ~5-8 ms，60fps (16ms 预算) 安全。
+        Legacy 路径单帧仅 5 次 itemconfig + 10 次 coords ≈ <1 ms。
+        """
+        if (self._use_pil
+                and self._wheel_base_pil is not None
+                and self._wheel_image_id is not None):
+            self._update_wheel_rotation_aa()
+        else:
+            self._update_wheel_rotation_legacy()
+
+    def _update_wheel_rotation_aa(self):
+        cx, cy, r = self._cx, self._cy, self._r
+        n = len(self.OPTIONS)
+        sector_angle = 360 / n
+        text_r = r * 0.66
+        try:
+            # BICUBIC 比 BILINEAR 更顺滑，比 LANCZOS 更快，旋转动画里最优解
+            rotated = self._wheel_base_pil.rotate(
+                self.angle, resample=Image.BICUBIC, expand=False,
+            )
+            new_photo = ImageTk.PhotoImage(rotated)
+            # 顺序很重要：先 itemconfig 让 tk 接管新 image，再覆盖 self._wheel_photo，
+            # 旧 photo 此时才进入 GC 候选，tk 已经不在用它了
+            self.canvas.itemconfig(self._wheel_image_id, image=new_photo)
+            self._wheel_photo = new_photo
+
+            for i in range(n):
+                start = self.angle + i * sector_angle
+                mid = math.radians(start + sector_angle / 2)
+                tx = cx + text_r * math.cos(mid)
+                ty = cy - text_r * math.sin(mid)
+                self.canvas.coords(self._icon_ids[i], tx, ty - 14)
+                self.canvas.coords(self._title_ids[i], tx, ty + 14)
+        except tk.TclError:
+            # 控件被销毁时静默退出
+            pass
+        except Exception as e:
+            # PIL 偶发异常 → 这一帧跳过，下一帧继续。不要让动画整体崩。
+            sys.stderr.write(f"[mood_tool] AA wheel rotate frame skipped: {e!r}\n")
+
+    def _update_wheel_rotation_legacy(self):
         if not self._arc_ids:
             self._build_wheel()
             return
@@ -1191,7 +1385,7 @@ class AnimatedNavBar(tk.Frame):
 class MoodApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("情绪调节小工具 v4.1 ✦ 灵动版 · High-FPS")
+        self.root.title("情绪调节小工具 v4.2 ✦ 灵动版 · Smooth-AA")
         self.root.geometry("960x780")
         self.root.minsize(880, 680)
         self.root.configure(bg=T["bg"])
