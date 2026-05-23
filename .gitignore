@@ -1,0 +1,15 @@
+# PyInstaller 产物
+build/
+dist/
+*.spec
+
+# 自动生成的图标（想跟随仓库可删除此行）
+icon.ico
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
