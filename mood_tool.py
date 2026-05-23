@@ -1,28 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-情绪调节小工具 — 灵动美化版 (Fluid UI v4.2 - Anti-Aliased Smooth)
-基于 fix/weather-suggestions 分支 (v3.7) 升级：
-1. 动画引擎：平滑展开/收起、淡入淡出、呼吸光效
-2. 悬停交互：卡片悬停发光、颜色渐变过渡
-3. 现代视觉：渐变头部、柔和配色、层次分明
-4. 流畅滚动：惯性滚动、平滑滚轮 + 可拖拽滑块
-5. 微交互：交错入场、状态切换动画、加载指示
-6. 心情转盘：5 选 1 等概率随机决策（喝茶 / 站起 / 刷手机 / 运动 / 零食）
-7. 保留全部 v3.7 功能：多源定位、SSL兼容、WeatherTipsDB、离线建议
+情绪调节小工具 — Cyber-HUD 科技感版 (Fluid UI v4.3 - Cyber HUD)
+基于 v4.2 抗锯齿版升级：
+1. 全新 Cyber-HUD 视觉语言：深空底 + 霓虹青/品红高亮 + 等宽 mono 标识
+2. 头部渐变 + HUD 网格线 + 角标 ◤◥，模拟舰桥屏幕
+3. 卡片 hover 时由 GlowCard 协议把边框过渡到霓虹青，营造"焦点高亮"
+4. 『快捷调节』点击展开改为**滑动展开**：抽屉式由 0 高度缓动到内容高度，
+   对应『内容不是直接出现，而是滑下来呈现』的体验
+5. 转盘扇区改用 5 种霓虹色 + 深色分隔线，配合霓虹青指针
+6. 状态文字、按钮、对话框统一切到 mono 终端风（如 // SYNCED, ACK 等）
 
-v4.1 流畅度专项优化（让画面过渡更顺滑、帧率更高）：
- - Animator: perf_counter 时间驱动 + 漂移补偿调度，目标 ~120Hz；同进度跳帧抑制
- - MoodWheel: 一次性 build canvas item，旋转期改用 itemconfig/coords 增量更新
-   （单帧 50+ 次 delete/create → 15 次属性改写，转盘真正"丝滑"）
- - 滚动：yview_moveto 亚像素分数滚动 + 速度累加 + 0.92 衰减，告别整行跳变
- - 呼吸光：50ms (20fps) → 16ms (~60fps)，颜色 lerp 平滑无台阶
+继承自 v4.2 的稳定能力（保留全部）：
+ - PIL 抗锯齿转盘 + BICUBIC 旋转
+ - perf_counter 时间驱动的高帧率动画引擎
+ - 亚像素分数滚动 + 惯性衰减
+ - 多源 IP 定位 + Open-Meteo 天气 + 离线建议兜底
+ - PyInstaller 封包后的尺寸/事件链兜底（多重 _refresh_scroll）
 
-v4.2 抗锯齿专项优化（让画面更光滑，告别像素台阶）：
- - MoodWheel：tk 的原生 create_arc 不支持抗锯齿，扇形边沿很糙；
-   改用 PIL 在 3x 超采样画面上绘制 pieslice，再 LANCZOS 下采样到显示尺寸，
-   边缘平滑度肉眼可见地提升一个档次。旋转使用 BICUBIC 重采样。
- - 圆角卡片：splinesteps 12 → 36，圆角曲线更柔和，不再"折角"。
- - 兜底：PIL 不可用时自动回退到原 tk 扇形渲染，不会崩。
+滑动展开的实现要点（详见 AnimatedExpandCard._expand）：
+ - 在 body 外包一层 `clip` Frame，pack_propagate(False) 锁定其高度；
+ - 内容先 pack 一次拿到 reqheight，再撤下挂到 clip 内；
+ - 动画把 clip.height 从 1 → target，ease_out_cubic，~320ms；
+ - 折叠反向：current_h → 1，ease_in_out_quart，~240ms（关比开略快，符合直觉）。
 """
 
 import os
@@ -57,33 +56,44 @@ except Exception:
     _HAS_PIL = False
 
 # ============================================================
-# 🎨 现代视觉主题 - 柔和渐变配色
+# 🛰️ 科技感视觉主题 - 深空底色 + 霓虹青/品红高亮
+# ------------------------------------------------------------
+# 设计思路：
+# - 主色调走 cyber-HUD 路线：深空蓝黑底色 + 霓虹青 (#00E5FF) 主操作色 +
+#   霓虹品红 (#FF2E9A) 作强调，模拟全息面板的发光感。
+# - 文字以亮青白 (#E0F7FA) 为主，二级文字降饱和、保持低噪声。
+# - 卡片底色比 bg 略亮一档，悬停态再亮一档，让层次像 HUD 面板叠加。
+# - prim_l（主色淡底）变成深青饱和底，配合 GlowCard 的 highlightbackground
+#   高亮时形成"边沿发光"效果。
 # ============================================================
 T = {
-    "bg":           "#F0F4F8",
-    "card":         "#FFFFFF",
-    "card_hover":   "#FAFCFF",
-    "nav_bg":       "#E8EDF5",
-    "prim":         "#6366F1",
-    "prim_dark":    "#4F46E5",
-    "prim_light":   "#A5B4FC",
-    "prim_l":       "#EEF2FF",
-    "accent":       "#8B5CF6",
-    "accent_light": "#C4B5FD",
-    "success":      "#10B981",
-    "warning":      "#F59E0B",
-    "warn":         "#F43F5E",
-    "text_h":       "#1E293B",
-    "text_b":       "#475569",
-    "text_s":       "#94A3B8",
-    "border":       "#E2E8F0",
-    "border_light": "#F1F5F9",
-    "white":        "#FFFFFF",
-    "shadow":       "#CBD5E1",
-    "glow":         "#818CF8",
-    "gradient_1":   "#6366F1",
-    "gradient_2":   "#8B5CF6",
-    "gradient_3":   "#A78BFA",
+    "bg":           "#070B14",   # 深空底（接近黑，但带蓝调）
+    "card":         "#0F1525",   # 一级面板
+    "card_hover":   "#162038",   # 悬停面板
+    "nav_bg":       "#0B1224",   # 导航容器底
+    "nav_active":   "#152340",   # 导航激活态底（不再用纯白）
+    "prim":         "#00E5FF",   # 霓虹青（主操作色）
+    "prim_dark":    "#00B8D4",   # 主操作色按下/激活态
+    "prim_light":   "#80F0FF",   # 主操作色淡（外发光）
+    "prim_l":       "#0E2236",   # 主色淡底（HUD 面板内层）
+    "accent":       "#FF2E9A",   # 霓虹品红（强调色）
+    "accent_light": "#FF80C8",   # 强调色淡
+    "success":      "#22FFB7",   # 霓虹绿（在线/同步成功）
+    "warning":      "#FFC857",   # 琥珀（轻提示）
+    "warn":         "#FF4D6D",   # 霓虹红（错误）
+    "text_h":       "#E0F7FA",   # 一级文字（亮青白）
+    "text_b":       "#9FB4C7",   # 二级文字
+    "text_s":       "#5C7185",   # 三级 / 注释级文字
+    "border":       "#1A2A40",   # 默认边框
+    "border_light": "#22344E",   # 浅边框（卡片默认描边）
+    "white":        "#FFFFFF",   # 仅用于"霓虹色背景上的纯白文字"
+    "shadow":       "#000000",
+    "glow":         "#00E5FF",   # 默认外发光色（与 prim 同）
+    "glow_accent":  "#FF2E9A",   # 强调外发光（品红）
+    "gradient_1":   "#0B1F33",   # header 渐变左
+    "gradient_2":   "#1B3A5C",   # header 渐变中
+    "gradient_3":   "#00E5FF",   # header 渐变右（霓虹青收尾）
+    "grid_line":    "#1B2C44",   # HUD 网格线（叠加在渐变上）
 }
 
 F = {
@@ -93,6 +103,10 @@ F = {
     "body":     ("Microsoft YaHei UI", 11),
     "small":    ("Microsoft YaHei UI", 10),
     "tiny":     ("Microsoft YaHei UI", 9),
+    # 等宽 / 科技字体：用于 HUD 标签、状态行、数字标号，强化"机舱仪表"既视感
+    "mono":     ("Consolas", 10),
+    "mono_b":   ("Consolas", 11, "bold"),
+    "mono_l":   ("Consolas", 14, "bold"),
     "emoji_l":  ("Segoe UI Emoji", 42),
     "emoji_m":  ("Segoe UI Emoji", 24),
     "emoji_s":  ("Segoe UI Emoji", 16),
@@ -719,27 +733,42 @@ class GlowCard(tk.Frame):
 
 
 class AnimatedExpandCard(tk.Frame):
-    """带动画展开效果的情绪方案卡片（圆角版）"""
+    """带『滑动展开』动画的情绪方案卡片（科技 HUD 风格）
+
+    点击展开行为（用户要求重点）：
+    - 之前：body 直接 `pack(fill="x")`，子内容瞬间出现，没有"打开"过程感。
+    - 现在：在 body 外再包一层"clipping frame"，用 pack_propagate(False) 强制锁定
+      其高度，由动画把高度从 0 缓动到内容的真实 reqheight，营造抽屉式滑下的视觉。
+    - 缓动用 ease_out_cubic：开头快、末尾慢，更符合物理减速直觉。
+    - 折叠时反向把高度从当前值 → 0，结束后销毁 clipping frame，下次展开重新构建。
+    - 同时配合箭头 ▸/▾ 切换 + 卡片边框脉冲，强化"被点击-在响应"的反馈。
+    """
+
+    EXPAND_MS = 320      # 展开动画时长
+    COLLAPSE_MS = 240    # 折叠动画时长（略短，符合"关闭比打开快"的直觉）
+
     def __init__(self, parent, item_data, animator, delay_index=0):
         super().__init__(parent, bg=T["bg"])
         self.data = item_data
         self.animator = animator
         self.expanded = False
-        self.body = None
+        self.body = None         # 真实内容 frame
+        self.body_clip = None    # clipping 容器（控制可见高度）
+        self.body_target_h = 0   # 内容自然高度（动画终点）
         self._animating = False
 
-        # 使用简化的圆角卡片（Frame + 圆角边框模拟）
+        # 卡片本体：深色面板 + 浅边框，悬停时由 GlowCard 协议变亮
         self.card = tk.Frame(self, bg=T["card"], bd=0,
                              highlightthickness=2, highlightbackground=T["border_light"])
         self.card.pack(fill="x", pady=2)
-        # 通过 configure relief + borderwidth 模拟圆角感
         self.card.configure(relief="flat")
 
         self.header = tk.Frame(self.card, bg=T["card"], padx=24, pady=20, cursor="hand2")
         self.header.pack(fill="x")
 
+        # 左侧 Emoji 圆框：底色用 prim_l（深青），呼应 HUD 面板内层
         icon_bg = tk.Frame(self.header, bg=T["prim_l"], width=52, height=52,
-                           highlightthickness=0)
+                           highlightthickness=1, highlightbackground=T["prim"])
         icon_bg.pack(side="left", padx=(0, 18))
         icon_bg.pack_propagate(False)
         icon_lbl = tk.Label(icon_bg, text=item_data["icon"], font=F["emoji_m"], bg=T["prim_l"])
@@ -747,20 +776,23 @@ class AnimatedExpandCard(tk.Frame):
 
         mid = tk.Frame(self.header, bg=T["card"])
         mid.pack(side="left", fill="x", expand=True)
-        title_lbl = tk.Label(mid, text=item_data["title"], font=F["head"], fg=T["text_h"], bg=T["card"])
+        # 标题前加一个 ▎竖线，类似 HUD 强调条
+        title_lbl = tk.Label(mid, text=f"▎ {item_data['title']}",
+                             font=F["head"], fg=T["text_h"], bg=T["card"])
         title_lbl.pack(anchor="w")
-        sub_lbl = tk.Label(mid, text=f"{len(item_data['methods'])} 个科学方案",
-                           font=F["small"], fg=T["text_s"], bg=T["card"])
+        sub_lbl = tk.Label(mid, text=f">> {len(item_data['methods'])} PROTOCOLS  ·  科学方案",
+                           font=F["mono"], fg=T["text_s"], bg=T["card"])
         sub_lbl.pack(anchor="w", pady=(2, 0))
 
-        self.arrow = tk.Label(self.header, text="▸", font=("Microsoft YaHei UI", 14),
-                             fg=T["prim"], bg=T["card"])
+        self.arrow = tk.Label(self.header, text="▸",
+                              font=("Microsoft YaHei UI", 14, "bold"),
+                              fg=T["prim"], bg=T["card"])
         self.arrow.pack(side="right", padx=(10, 0))
 
         for w in (self.header, icon_bg, icon_lbl, title_lbl, sub_lbl, self.arrow):
             w.bind("<Button-1>", lambda e: self._toggle())
 
-        # 入场动画
+        # 入场动画：边框颜色由 bg 渐变到 border_light
         self.card.configure(highlightbackground=T["bg"])
         self.after(delay_index * 80, self._entrance)
 
@@ -778,39 +810,136 @@ class AnimatedExpandCard(tk.Frame):
         if self.expanded: self._collapse()
         else: self._expand()
 
-    def _expand(self):
-        self._animating = True
-        self.expanded = True
-        self.arrow.config(text="▾")
-        self.body = tk.Frame(self.card, bg=T["prim_l"], padx=24, pady=0)
-        self.body.pack(fill="x")
+    def _build_body_content(self):
+        """构造一次性 body 内容（不挂载到屏幕），供 _expand 测量高度后再 pack。
+
+        先把 body 创建在 self.card 下但不 pack，等内容渲染完用 winfo_reqheight()
+        拿到自然高度，再交给 clipping frame 做高度动画。
+        """
+        body = tk.Frame(self.card, bg=T["prim_l"], padx=24, pady=10)
         for i, (m_title, m_desc) in enumerate(self.data["methods"], 1):
-            mf = tk.Frame(self.body, bg=T["card"], padx=18, pady=14,
+            mf = tk.Frame(body, bg=T["card"], padx=18, pady=14,
                           highlightthickness=1, highlightbackground=T["border_light"])
             mf.pack(fill="x", pady=5, padx=4)
-            num = tk.Frame(mf, bg=T["prim"], width=24, height=24)
+
+            # 序号方块：从圆形换成扁平方块，更"机械"一点
+            num = tk.Frame(mf, bg=T["prim"], width=26, height=26)
             num.pack(side="left", padx=(0, 14))
             num.pack_propagate(False)
-            tk.Label(num, text=str(i), font=F["tiny"], fg=T["white"],
-                    bg=T["prim"]).place(relx=0.5, rely=0.5, anchor="center")
+            tk.Label(num, text=f"{i:02d}", font=F["mono_b"], fg=T["bg"],
+                     bg=T["prim"]).place(relx=0.5, rely=0.5, anchor="center")
+
             tf = tk.Frame(mf, bg=T["card"])
             tf.pack(side="left", fill="x", expand=True)
             tk.Label(tf, text=m_title, font=F["head"], fg=T["prim"],
-                    bg=T["card"], anchor="w").pack(fill="x")
+                     bg=T["card"], anchor="w").pack(fill="x")
             tk.Label(tf, text=m_desc, font=F["body"], fg=T["text_b"],
-                    bg=T["card"], wraplength=580, justify="left", anchor="w").pack(fill="x", pady=(4,0))
-            mf.bind("<Enter>", lambda e, f=mf: f.configure(highlightbackground=T["prim_light"]))
+                     bg=T["card"], wraplength=580, justify="left",
+                     anchor="w").pack(fill="x", pady=(4, 0))
+
+            # 内层方法卡片悬停高亮：边框颜色直接切（差距小，不必动画）
+            mf.bind("<Enter>", lambda e, f=mf: f.configure(highlightbackground=T["prim"]))
             mf.bind("<Leave>", lambda e, f=mf: f.configure(highlightbackground=T["border_light"]))
-        tk.Frame(self.body, bg=T["prim_l"], height=12).pack(fill="x")
-        self.animator.pulse(self.card, T["border_light"], T["prim_light"], duration=600)
-        self._animating = False
+
+        # body 底部留 12px 视觉透气
+        tk.Frame(body, bg=T["prim_l"], height=12).pack(fill="x")
+        return body
+
+    def _expand(self):
+        """滑下展开：
+        1. 构造 body 内容，离屏测量自然高度；
+        2. 创建 clipping frame，初始高度 1px、pack_propagate 关闭；
+        3. body pack 到 clip 内（pack_propagate=False 保证 body 不会撑大 clip）；
+        4. 动画把 clip.height 从 0 → target，eased，~320ms；
+        5. 动画完成后保留 pack_propagate(False)：内容尺寸已固定，避免后续 reflow。
+        """
+        if self._animating:
+            return
+        self._animating = True
+        self.expanded = True
+        self.arrow.config(text="▾")
+
+        # 1) 构造 body（暂不挂载） → 测量自然高度
+        body = self._build_body_content()
+        # 临时把 body 直接 pack 一下让它走一次布局，拿到 reqheight，然后再撤下
+        body.pack(fill="x")
+        self.card.update_idletasks()
+        target_h = max(body.winfo_reqheight(), 1)
+        body.pack_forget()
+
+        # 2) 创建 clip 并锁定高度
+        clip = tk.Frame(self.card, bg=T["prim_l"], height=1)
+        clip.pack(fill="x")
+        clip.pack_propagate(False)
+        # 3) body 重新挂到 clip 里（顶对齐，超出部分被 clip 截掉）
+        body.pack(in_=clip, fill="x", side="top")
+
+        self.body = body
+        self.body_clip = clip
+        self.body_target_h = target_h
+
+        def _update(p):
+            if not clip.winfo_exists():
+                return
+            h = max(int(target_h * p), 1)
+            try:
+                clip.configure(height=h)
+            except tk.TclError:
+                pass
+
+        def _done():
+            # 兜底：动画末尾把高度精确设到 target，避免最后一帧因取整漏 1-2px
+            try:
+                if clip.winfo_exists():
+                    clip.configure(height=target_h)
+            except tk.TclError:
+                pass
+            self._animating = False
+            # 边框做一次脉冲：与 GlowCard 自身的 hover 动画无冲突
+            self.animator.pulse(self.card, T["border_light"], T["prim"], duration=600)
+
+        self.animator.animate(self.EXPAND_MS, _update, on_complete=_done,
+                              easing=AnimationEngine.ease_out_cubic)
 
     def _collapse(self):
+        """滑上收起：高度 current → 0，结束后销毁 clip，箭头切回 ▸。
+
+        起始高度从 clip 当前 winfo_height() 取，而不是硬编码 target_h，
+        这样在用户"展开过程没结束就再次点击"的极端情况下也能从当前帧平滑收起。
+        """
+        if self._animating or self.body_clip is None:
+            return
         self._animating = True
         self.arrow.config(text="▸")
-        if self.body: self.body.destroy(); self.body = None
-        self.expanded = False
-        self._animating = False
+
+        clip = self.body_clip
+        try:
+            current_h = max(clip.winfo_height(), 1)
+        except tk.TclError:
+            current_h = self.body_target_h or 1
+
+        def _update(p):
+            if not clip.winfo_exists():
+                return
+            h = max(int(current_h * (1 - p)), 1)
+            try:
+                clip.configure(height=h)
+            except tk.TclError:
+                pass
+
+        def _done():
+            try:
+                if clip.winfo_exists():
+                    clip.destroy()
+            except tk.TclError:
+                pass
+            self.body_clip = None
+            self.body = None
+            self.expanded = False
+            self._animating = False
+
+        self.animator.animate(self.COLLAPSE_MS, _update, on_complete=_done,
+                              easing=AnimationEngine.ease_in_out_quart)
 
 
 class MoodWheel(tk.Frame):
@@ -849,11 +978,12 @@ class MoodWheel(tk.Frame):
     ]
 
     SECTOR_COLORS = [
-        "#FCA5A5",  # 茶 - 暖红
-        "#FCD34D",  # 椅 - 黄
-        "#86EFAC",  # 手机 - 绿
-        "#93C5FD",  # 运动 - 蓝
-        "#C4B5FD",  # 零食 - 紫
+        # 五种霓虹色 —— 在深空底上自带"全息扇区"既视感
+        "#FF4D9B",  # 茶 - 霓虹品红
+        "#FFC857",  # 椅 - 霓虹琥珀
+        "#22FFB7",  # 手机 - 霓虹绿
+        "#00E5FF",  # 运动 - 霓虹青
+        "#B388FF",  # 零食 - 霓虹紫
     ]
 
     def __init__(self, parent, animator):
@@ -880,14 +1010,14 @@ class MoodWheel(tk.Frame):
         head = tk.Frame(self, bg=T["bg"])
         head.pack(fill="x", padx=30, pady=(20, 12))
         tk.Label(head, text="🎡", font=F["emoji_s"], bg=T["bg"]).pack(side="left")
-        tk.Label(head, text="  转一下，让随机替你做决定", font=F["head"],
-                 fg=T["text_h"], bg=T["bg"]).pack(side="left")
-        tk.Label(head, text=f"共 {len(self.OPTIONS)} 个选项 · 等概率",
-                 font=F["small"], fg=T["text_s"], bg=T["bg"]).pack(side="right")
-        tk.Frame(self, bg=T["border"], height=1).pack(fill="x", padx=30, pady=(0, 16))
+        tk.Label(head, text="  ▎ RANDOM_DECISION_MODULE", font=F["mono_l"],
+                 fg=T["prim"], bg=T["bg"]).pack(side="left")
+        tk.Label(head, text=f">> {len(self.OPTIONS)} CHOICES · 等概率",
+                 font=F["mono"], fg=T["text_s"], bg=T["bg"]).pack(side="right")
+        tk.Frame(self, bg=T["prim"], height=1).pack(fill="x", padx=30, pady=(0, 16))
 
-        tk.Label(self, text="不知道现在该做什么？让转盘替你决定。",
-                 font=F["body"], fg=T["text_b"], bg=T["bg"]).pack(pady=(0, 12))
+        tk.Label(self, text="// 不知道现在该做什么？让转盘替你决定。",
+                 font=F["mono"], fg=T["text_b"], bg=T["bg"]).pack(pady=(0, 12))
 
         # ---- 转盘画布 ----
         self.canvas = tk.Canvas(
@@ -899,16 +1029,16 @@ class MoodWheel(tk.Frame):
 
         # ---- 结果提示行 ----
         self.result_label = tk.Label(
-            self, text="点击下方按钮，让转盘开始旋转 ✨",
-            font=F["body"], fg=T["text_s"], bg=T["bg"],
+            self, text="// 点击下方按钮，让转盘开始旋转 ✨",
+            font=F["mono"], fg=T["text_s"], bg=T["bg"],
         )
         self.result_label.pack(pady=(8, 8))
 
-        # ---- 旋转按钮 ----
+        # ---- 旋转按钮（霓虹青底 + 深色字，HUD 操控按键风）----
         self.btn = tk.Label(
-            self, text="🎲   开始旋转   🎲", font=F["head"],
-            bg=T["prim"], fg=T["white"], padx=44, pady=14,
-            cursor="hand2",
+            self, text="🎲   START SPIN   🎲", font=F["mono_l"],
+            bg=T["prim"], fg=T["bg"], padx=44, pady=14,
+            cursor="hand2", highlightthickness=2, highlightbackground=T["prim_light"],
         )
         self.btn.pack(pady=(8, 24))
         self.btn.bind("<Button-1>", lambda e: self.spin())
@@ -990,6 +1120,7 @@ class MoodWheel(tk.Frame):
 
         # 文字标签依然用 canvas text（freetype 已天然抗锯齿，无须 PIL）。
         # 旋转时只需 update coords，不必重建 widget。
+        # 注意：扇区是高饱和霓虹色，用深色文字 (T["bg"]) 比浅色对比度更高、更"贴片"。
         n = len(self.OPTIONS)
         sector_angle = 360 / n
         text_r = r * 0.66
@@ -1002,7 +1133,7 @@ class MoodWheel(tk.Frame):
                 tx, ty - 14, text=icon, font=("Segoe UI Emoji", 22),
             )
             title_id = self.canvas.create_text(
-                tx, ty + 14, text=title, font=F["small"], fill=T["text_h"],
+                tx, ty + 14, text=title, font=F["small"], fill=T["bg"],
             )
             self._icon_ids.append(icon_id)
             self._title_ids.append(title_id)
@@ -1032,7 +1163,9 @@ class MoodWheel(tk.Frame):
         sector_angle = 360.0 / n
         bbox = (0, 0, big - 1, big - 1)
         outline_w = max(1, 3 * SS)
-        white = (255, 255, 255, 255)
+        # 扇区分隔线用底色 (#070B14)：深空底上看是『黑色细缝』，
+        # 凸显霓虹扇区像 HUD 数据切片
+        sep_rgb = tuple(int(T["bg"][j:j+2], 16) for j in (1, 3, 5)) + (255,)
 
         for i in range(n):
             start = i * sector_angle
@@ -1041,7 +1174,7 @@ class MoodWheel(tk.Frame):
             rgb = tuple(int(color_hex[j:j+2], 16) for j in (1, 3, 5))
             draw.pieslice(
                 bbox, start, end,
-                fill=rgb + (255,), outline=white, width=outline_w,
+                fill=rgb + (255,), outline=sep_rgb, width=outline_w,
             )
 
         # PIL 的 CW 翻成 tk arc 的 CCW
@@ -1062,7 +1195,7 @@ class MoodWheel(tk.Frame):
             arc_id = self.canvas.create_arc(
                 cx - r, cy - r, cx + r, cy + r,
                 start=start, extent=sector_angle,
-                fill=color, outline=T["white"], width=3, style="pieslice",
+                fill=color, outline=T["bg"], width=3, style="pieslice",
             )
             self._arc_ids.append(arc_id)
 
@@ -1072,22 +1205,23 @@ class MoodWheel(tk.Frame):
             icon_id = self.canvas.create_text(tx, ty - 14, text=icon,
                                               font=("Segoe UI Emoji", 22))
             title_id = self.canvas.create_text(tx, ty + 14, text=title,
-                                               font=F["small"], fill=T["text_h"])
+                                               font=F["small"], fill=T["bg"])
             self._icon_ids.append(icon_id)
             self._title_ids.append(title_id)
 
     def _draw_static_overlay(self):
-        """中心圆盘 + 🎯 + 顶部三角指针：不随旋转变，画在 wheel 之上。"""
+        """中心圆盘 + 🎯 + 顶部三角指针：不随旋转变，画在 wheel 之上。
+        中心盘换成深色面板 + 霓虹青描边，呼应 HUD 主题。"""
         cx, cy = self._cx, self._cy
         cr = 28
         self.canvas.create_oval(cx - cr, cy - cr, cx + cr, cy + cr,
-                                fill=T["white"], outline=T["prim"], width=3)
+                                fill=T["card"], outline=T["prim"], width=3)
         self.canvas.create_text(cx, cy, text="🎯",
                                 font=("Segoe UI Emoji", 22))
-        # 顶部指针（静态）
+        # 顶部指针：霓虹青三角，深色细描边
         self.canvas.create_polygon(
             cx - 16, 4, cx + 16, 4, cx, 36,
-            fill=T["prim_dark"], outline=T["white"], width=2,
+            fill=T["prim"], outline=T["bg"], width=2,
         )
 
     def _update_wheel_rotation(self):
@@ -1166,7 +1300,7 @@ class MoodWheel(tk.Frame):
         if self.spinning:
             return
         self.spinning = True
-        self.btn.config(bg=T["text_s"], text="🌀   旋转中...")
+        self.btn.config(bg=T["text_s"], text="🌀   SPINNING ...")
         self.result_label.config(text="🌀  转盘正在为你挑选...", fg=T["prim"])
 
         n = len(self.OPTIONS)
@@ -1197,7 +1331,7 @@ class MoodWheel(tk.Frame):
             self.angle = end_angle
             self._update_wheel_rotation()
             self.spinning = False
-            self.btn.config(bg=T["prim"], text="🎲   再转一次   🎲")
+            self.btn.config(bg=T["prim"], text="🎲   RE-SPIN   🎲")
             self._show_result(target_idx)
 
         # 3 秒 + ease_out_cubic：开头快、末尾慢慢停下，物理感更强
@@ -1231,7 +1365,7 @@ class WheelResultDialog(tk.Toplevel):
 
     def __init__(self, parent, icon, title, desc):
         super().__init__(parent)
-        self.title("✨ 转盘结果")
+        self.title("✨ DECISION_LOCKED")
         self.configure(bg=T["card"])
         self.resizable(False, False)
         # 模态：阻塞在父窗口上，避免连续乱点旋转
@@ -1256,33 +1390,39 @@ class WheelResultDialog(tk.Toplevel):
         except tk.TclError:
             pass
 
-        # 顶部装饰条（稍加厚一点，更显眼）
-        tk.Frame(self, bg=T["prim"], height=8).pack(fill="x")
+        # 顶部装饰条（霓虹青 → 品红双层，HUD 警示带感）
+        tk.Frame(self, bg=T["prim"], height=4).pack(fill="x")
+        tk.Frame(self, bg=T["accent"], height=2).pack(fill="x")
+
+        # 头部 mono 标识
+        tk.Label(self, text="// LOCKED IN", font=F["mono_b"],
+                 fg=T["prim"], bg=T["card"]).pack(pady=(16, 0))
 
         # 图标 + 标题
         tk.Label(self, text=icon, font=("Segoe UI Emoji", 60),
-                 bg=T["card"]).pack(pady=(28, 6))
+                 bg=T["card"]).pack(pady=(8, 6))
         tk.Label(self, text=title, font=F["title"],
                  fg=T["text_h"], bg=T["card"]).pack()
-        tk.Label(self, text="✨  转盘为你选定", font=F["small"],
+        tk.Label(self, text=">> 转盘为你选定", font=F["mono"],
                  fg=T["text_s"], bg=T["card"]).pack(pady=(6, 18))
 
         # 描述卡片：使用 subtitle 字号让长描述更清楚易读
         desc_frame = tk.Frame(
             self, bg=T["prim_l"],
             padx=self.INNER_PAD, pady=self.INNER_PAD,
-            highlightthickness=1, highlightbackground=T["prim_light"],
+            highlightthickness=1, highlightbackground=T["prim"],
         )
         desc_frame.pack(fill="x", padx=self.OUTER_PAD)
         tk.Label(
-            desc_frame, text=desc, font=F["subtitle"], fg=T["text_b"],
+            desc_frame, text=desc, font=F["subtitle"], fg=T["text_h"],
             bg=T["prim_l"], wraplength=wraplength, justify="left",
         ).pack(anchor="w", fill="x")
 
-        # 关闭按钮
-        btn = tk.Label(self, text="知道了，去做这件事", font=F["head"],
-                       bg=T["prim"], fg=T["white"], padx=36, pady=12,
-                       cursor="hand2")
+        # 关闭按钮（霓虹按键风）
+        btn = tk.Label(self, text="ACK · 去做这件事", font=F["mono_b"],
+                       bg=T["prim"], fg=T["bg"], padx=36, pady=12,
+                       cursor="hand2", highlightthickness=2,
+                       highlightbackground=T["prim_light"])
         btn.pack(pady=(24, 26))
         btn.bind("<Button-1>", lambda e: self.destroy())
         btn.bind("<Enter>", lambda e: btn.config(bg=T["prim_dark"]))
@@ -1295,57 +1435,100 @@ class WheelResultDialog(tk.Toplevel):
 
 
 class GradientHeader(tk.Canvas):
-    """渐变色头部"""
+    """🛰️ HUD 风格渐变头部
+    - 渐变：深空蓝 → 中蓝 → 霓虹青，模拟全息面板从底升起
+    - 网格线：等距细线 + 中央十字定位线，强化"机舱仪表"既视感
+    - 角标：左上角 ◤ 与右上角 ◥ 装饰，类似舰桥屏幕的边角
+    - 标题文案使用类终端风：[ SYS // MOOD CTRL ] + 时段问候
+    """
     def __init__(self, parent, height=130):
         super().__init__(parent, height=height, highlightthickness=0, bd=0)
         self.pack(fill="x")
         self.h = height
         self.bind("<Configure>", self._draw)
 
+    @staticmethod
+    def _hex_to_rgb(c):
+        return int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)
+
     def _draw(self, event=None):
-        self.delete("gradient")
+        self.delete("all")
         w = self.winfo_width()
-        if w <= 1: return
-        steps = 80
+        if w <= 1:
+            return
+
+        g1 = self._hex_to_rgb(T["gradient_1"])
+        g2 = self._hex_to_rgb(T["gradient_2"])
+        g3 = self._hex_to_rgb(T["gradient_3"])
+
+        # 1. 横向渐变底
+        steps = 96
         for i in range(steps):
             t = i / steps
             if t < 0.5:
                 t2 = t * 2
-                r = int(int(T["gradient_1"][1:3],16)*(1-t2) + int(T["gradient_2"][1:3],16)*t2)
-                g = int(int(T["gradient_1"][3:5],16)*(1-t2) + int(T["gradient_2"][3:5],16)*t2)
-                b = int(int(T["gradient_1"][5:7],16)*(1-t2) + int(T["gradient_2"][5:7],16)*t2)
+                r = int(g1[0] + (g2[0] - g1[0]) * t2)
+                g = int(g1[1] + (g2[1] - g1[1]) * t2)
+                b = int(g1[2] + (g2[2] - g1[2]) * t2)
             else:
                 t2 = (t - 0.5) * 2
-                r = int(int(T["gradient_2"][1:3],16)*(1-t2) + int(T["gradient_3"][1:3],16)*t2)
-                g = int(int(T["gradient_2"][3:5],16)*(1-t2) + int(T["gradient_3"][3:5],16)*t2)
-                b = int(int(T["gradient_2"][5:7],16)*(1-t2) + int(T["gradient_3"][5:7],16)*t2)
+                r = int(g2[0] + (g3[0] - g2[0]) * t2)
+                g = int(g2[1] + (g3[1] - g2[1]) * t2)
+                b = int(g2[2] + (g3[2] - g2[2]) * t2)
             color = f"#{r:02x}{g:02x}{b:02x}"
-            x0, x1 = int(w*i/steps), int(w*(i+1)/steps)+1
-            self.create_rectangle(x0, 0, x1, self.h, fill=color, outline=color, tags="gradient")
+            x0, x1 = int(w * i / steps), int(w * (i + 1) / steps) + 1
+            self.create_rectangle(x0, 0, x1, self.h, fill=color, outline=color)
+
+        # 2. HUD 网格线（细线，低饱和），强化"机舱面板"视觉
+        grid = T["grid_line"]
+        for gx in range(0, w, 48):
+            self.create_line(gx, 0, gx, self.h, fill=grid, width=1)
+        for gy in range(0, self.h, 24):
+            self.create_line(0, gy, w, gy, fill=grid, width=1)
+
+        # 3. 顶/底霓虹细线（边沿发光）
+        self.create_line(0, 1, w, 1, fill=T["prim"], width=1)
+        self.create_line(0, self.h - 2, w, self.h - 2, fill=T["accent"], width=1)
+
+        # 4. 左/右角标
+        self.create_text(18, 14, text="◤  SYS // MOOD CTRL  v4.2",
+                         font=F["mono_b"], fill=T["prim_light"], anchor="w")
+        self.create_text(w - 18, 14, text=datetime.now().strftime("%H:%M:%S  ◥"),
+                         font=F["mono_b"], fill=T["prim_light"], anchor="e")
+
+        # 5. 中央问候 + 副标题
         hour = datetime.now().hour
-        greeting = ("早安，开启舒心的一天 ☀️" if 5 <= hour < 12
-                    else "午后好，恢复能量 🌤️" if 12 <= hour < 18
-                    else "晚安，静享安宁 🌙")
-        self.create_text(w//2, self.h//2-14, text=greeting, font=F["title"], fill="white", tags="gradient")
-        self.create_text(w//2, self.h//2+20, text="✦ 基于心理学方案 · 陪你调节每一份情绪 ✦",
-                        font=F["body"], fill="#E0E7FF", tags="gradient")
+        greeting = ("> 早安  ·  开启舒心一天 ☀" if 5 <= hour < 12
+                    else "> 午后好  ·  恢复能量 🌤" if 12 <= hour < 18
+                    else "> 晚安  ·  静享安宁 🌙")
+        self.create_text(w // 2, self.h // 2 - 8, text=greeting,
+                         font=F["title"], fill=T["text_h"])
+        self.create_text(w // 2, self.h // 2 + 24,
+                         text="[ 心理学方案接管中 · 实时陪你调节情绪 ]",
+                         font=F["mono_b"], fill=T["prim"])
 
 
 class AnimatedNavBar(tk.Frame):
-    """带动画的圆角导航栏"""
+    """带动画的圆角导航栏（科技 HUD 风）
+
+    - 容器：深色 nav_bg 上加一道霓虹青下划线，模拟舱内仪表条
+    - 激活态：底色 nav_active（深蓝灰），文字霓虹青；未激活态文字 text_s
+    - 切换：动画在 nav_bg ↔ nav_active 之间渐变，避免突兀切色
+    """
     def __init__(self, parent, tabs, on_switch, animator):
         super().__init__(parent, bg=T["bg"], pady=14)
         self.animator = animator
         self.on_switch = on_switch
         self.current_idx = 0
-        # 圆角药丸形容器
+        # HUD 容器：深色底 + 霓虹青描边
         self.pill = tk.Frame(self, bg=T["nav_bg"], padx=6, pady=6,
-                             highlightthickness=1, highlightbackground=T["border_light"])
+                             highlightthickness=1, highlightbackground=T["prim"])
         self.pill.pack(anchor="center")
         self.btns = []
         for i, (icon, name) in enumerate(tabs):
             btn = tk.Label(self.pill, text=f"{icon}  {name}", font=F["body"],
-                          padx=32, pady=10, cursor="hand2", bg=T["nav_bg"], fg=T["text_s"])
+                          padx=32, pady=10, cursor="hand2",
+                          bg=T["nav_bg"], fg=T["text_s"])
             btn.pack(side="left", padx=3)
             btn.bind("<Button-1>", lambda e, idx=i: self._switch_to(idx))
             btn.bind("<Enter>", lambda e, b=btn, idx=i: self._hover(b, idx, True))
@@ -1364,19 +1547,19 @@ class AnimatedNavBar(tk.Frame):
             if i == idx:
                 if animate:
                     def _update(p, b=btn):
-                        bg = Animator._lerp_color(T["nav_bg"], T["white"], p)
+                        bg = Animator._lerp_color(T["nav_bg"], T["nav_active"], p)
                         fg = Animator._lerp_color(T["text_s"], T["prim"], p)
                         try: b.config(bg=bg, fg=fg)
                         except tk.TclError: pass
                     self.animator.animate(200, _update, easing=AnimationEngine.ease_out_expo)
                 else:
-                    btn.config(bg=T["white"], fg=T["prim"])
+                    btn.config(bg=T["nav_active"], fg=T["prim"])
             else:
                 btn.config(bg=T["nav_bg"], fg=T["text_s"])
 
     def _hover(self, btn, idx, entering):
         if idx == self.current_idx: return
-        btn.config(fg=T["text_b"] if entering else T["text_s"])
+        btn.config(fg=T["text_h"] if entering else T["text_s"])
 
 
 # ============================================================
@@ -1385,7 +1568,7 @@ class AnimatedNavBar(tk.Frame):
 class MoodApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("情绪调节小工具 v4.2 ✦ 灵动版 · Smooth-AA")
+        self.root.title("MOOD CTRL // 情绪调节小工具 v4.2 · CYBER-HUD")
         self.root.geometry("960x780")
         self.root.minsize(880, 680)
         self.root.configure(bg=T["bg"])
@@ -1442,17 +1625,25 @@ class MoodApp:
         self._switch_page(0)
 
     def _init_footer(self):
-        footer = tk.Frame(self.root, bg=T["border_light"], height=32,
+        # 底部状态条：深色 + 顶端霓虹细线，模仿 HUD 状态栏
+        footer = tk.Frame(self.root, bg=T["card"], height=32,
                           highlightthickness=0)
         footer.pack(fill="x", side="bottom")
         footer.pack_propagate(False)
-        self.status_dot = tk.Label(footer, text="●", font=F["tiny"], fg=T["success"], bg=T["border_light"])
+        # 顶部 1px 霓虹分割线
+        tk.Frame(footer, bg=T["prim"], height=1).place(x=0, y=0, relwidth=1)
+
+        self.status_dot = tk.Label(footer, text="●", font=F["tiny"],
+                                   fg=T["success"], bg=T["card"])
         self.status_dot.pack(side="left", padx=(20, 6), pady=6)
-        self.status_label = tk.Label(footer, text="系统就绪 · 等待数据同步",
-                                    font=F["tiny"], fg=T["text_s"], bg=T["border_light"])
+        self.status_label = tk.Label(footer,
+                                     text="// SYS_READY · 等待数据同步",
+                                     font=F["mono"], fg=T["text_b"], bg=T["card"])
         self.status_label.pack(side="left", pady=6)
-        tk.Label(footer, text=datetime.now().strftime("%Y-%m-%d %H:%M"),
-                font=F["tiny"], fg=T["text_s"], bg=T["border_light"]).pack(side="right", padx=20, pady=6)
+        tk.Label(footer,
+                 text=datetime.now().strftime("◌ %Y-%m-%d %H:%M"),
+                 font=F["mono"], fg=T["text_s"], bg=T["card"]).pack(side="right",
+                                                                    padx=20, pady=6)
 
     def _switch_page(self, idx):
         # 三页用列表统一管理，避免 if/else 分支随页面增加而膨胀
@@ -1504,7 +1695,7 @@ class MoodApp:
         if self.page_weather._rendered:
             return
 
-        weather_card = GlowCard(c, self.animator, glow_color=T["accent_light"])
+        weather_card = GlowCard(c, self.animator, glow_color=T["prim"])
         weather_card.pack(fill="x", padx=30, pady=(24, 16))
         # 保存引用，让 _apply_weather 的脉冲走 GlowCard 协同通道，
         # 避免直接写 highlightbackground 与 hover 动画相互抢占
@@ -1517,22 +1708,30 @@ class MoodApp:
 
         info = tk.Frame(wi, bg=T["card"])
         info.pack(side="left", padx=30, fill="x", expand=True)
-        self.lbl_temp = tk.Label(info, text="--°C", font=F["title"], fg=T["text_h"], bg=T["card"])
+        # 顶部小 mono 标识，让卡片像 HUD 仪表
+        tk.Label(info, text="▎ LIVE  ·  WEATHER", font=F["mono_b"],
+                 fg=T["prim"], bg=T["card"]).pack(anchor="w")
+        self.lbl_temp = tk.Label(info, text="--°C", font=F["title"],
+                                 fg=T["text_h"], bg=T["card"])
         self.lbl_temp.pack(anchor="w")
-        self.lbl_desc = tk.Label(info, text="正在同步天气数据...", font=F["body"], fg=T["text_s"], bg=T["card"])
+        self.lbl_desc = tk.Label(info, text="// 正在同步天气数据 ...",
+                                 font=F["mono"], fg=T["text_s"], bg=T["card"])
         self.lbl_desc.pack(anchor="w", pady=(4, 0))
 
-        self.loading_dot = tk.Label(wi, text="◌", font=("Segoe UI", 16), fg=T["prim_light"], bg=T["card"])
+        self.loading_dot = tk.Label(wi, text="◌", font=("Segoe UI", 16),
+                                    fg=T["prim"], bg=T["card"])
         self.loading_dot.pack(side="right", padx=10)
         self._animate_loading()
 
-        self.suggest_headline = tk.Label(c, text="💡 今日建议", font=F["head"], bg=T["bg"], fg=T["text_h"])
+        self.suggest_headline = tk.Label(c, text="▎ TIPS  ·  今日建议", font=F["mono_l"],
+                                         bg=T["bg"], fg=T["prim"])
         self.suggest_headline.pack(anchor="w", padx=30, pady=(10, 8))
 
         self.suggest_container = tk.Frame(c, bg=T["bg"])
         self.suggest_container.pack(fill="x", padx=28)
-        tk.Label(self.suggest_container, text="正在为您匹配最契合当前天气的情绪调节方案... ✨",
-                font=F["body"], fg=T["text_s"], bg=T["bg"]).pack(anchor="w", padx=5)
+        tk.Label(self.suggest_container,
+                 text="// 正在为您匹配最契合当前天气的情绪调节方案... ✨",
+                 font=F["mono"], fg=T["text_s"], bg=T["bg"]).pack(anchor="w", padx=5)
         # 仅在全部 widget 创建成功后再标记已渲染，
         # 避免中途异常把页面卡在"_rendered=True 但内容残缺"的状态。
         self.page_weather._rendered = True
@@ -1548,9 +1747,11 @@ class MoodApp:
         hf = tk.Frame(c, bg=T["bg"])
         hf.pack(fill="x", padx=30, pady=(20, 12))
         tk.Label(hf, text="⚡", font=F["emoji_s"], bg=T["bg"]).pack(side="left")
-        tk.Label(hf, text="  针对性情绪方案", font=F["head"], fg=T["text_h"], bg=T["bg"]).pack(side="left")
-        tk.Label(hf, text=f"共 {len(QuickDB.ITEMS)} 种情绪", font=F["small"], fg=T["text_s"], bg=T["bg"]).pack(side="right")
-        tk.Frame(c, bg=T["border"], height=1).pack(fill="x", padx=30, pady=(0, 8))
+        tk.Label(hf, text="  ▎ EMOTION_PROTOCOLS  ·  针对性情绪方案",
+                 font=F["mono_l"], fg=T["prim"], bg=T["bg"]).pack(side="left")
+        tk.Label(hf, text=f">> {len(QuickDB.ITEMS)} TARGETS  ·  点击展开",
+                 font=F["mono"], fg=T["text_s"], bg=T["bg"]).pack(side="right")
+        tk.Frame(c, bg=T["prim"], height=1).pack(fill="x", padx=30, pady=(0, 8))
         for i, item in enumerate(QuickDB.ITEMS):
             AnimatedExpandCard(c, item, self.animator, delay_index=i).pack(fill="x", padx=28, pady=4)
         tk.Frame(c, bg=T["bg"], height=30).pack(fill="x")
@@ -1625,24 +1826,25 @@ class MoodApp:
             except: temp_text = "--°C"
             self.w_icon.config(text=res["emoji"])
             self.lbl_temp.config(text=temp_text, fg=T["text_h"])
-            self.lbl_desc.config(text=f"📍 {res['city']} · {res['desc']}", fg=T["text_s"])
+            self.lbl_desc.config(text=f"📍 {res['city']} · {res['desc']}", fg=T["text_b"])
             if self.loading_dot: self.loading_dot.config(text="✓", fg=T["success"])
-            self.status_label.config(text=f"已同步 · {res['city']} {res['desc']} {temp_text}")
+            self.status_label.config(
+                text=f"// SYNCED · {res['city']} {res['desc']} {temp_text}")
             tips = WeatherTipsDB.get(res["code"], temp)
             self._populate_suggestions(tips)
             self._refresh_scroll(self.page_weather)
             # 走 GlowCard 自身的脉冲通道，与 hover 动画协同（不会互相抢色）
             try:
                 if hasattr(self, "weather_card") and self.weather_card.winfo_exists():
-                    self.weather_card.pulse_glow(T["accent_light"], duration=1000)
+                    self.weather_card.pulse_glow(T["accent"], duration=1000)
             except Exception:
                 pass
         else:
             self.lbl_temp.config(text="--°C", fg=T["warn"])
-            self.lbl_desc.config(text="天气同步失败，已为您切换为离线建议", fg=T["warn"])
+            self.lbl_desc.config(text="// NETWORK_FAIL · 已切换为离线建议", fg=T["warn"])
             self.w_icon.config(text="📵")
             if self.loading_dot: self.loading_dot.config(text="✗", fg=T["warn"])
-            self.status_label.config(text="网络异常 · 已启用离线建议")
+            self.status_label.config(text="// OFFLINE_MODE · 已启用离线建议")
             self.status_dot.config(fg=T["warn"])
             self._populate_suggestions(WeatherTipsDB.offline())
             self._refresh_scroll(self.page_weather)
@@ -1651,16 +1853,17 @@ class MoodApp:
         if not self.suggest_container or not self.suggest_container.winfo_exists(): return
         for w in self.suggest_container.winfo_children(): w.destroy()
         if self.suggest_headline and self.suggest_headline.winfo_exists():
-            self.suggest_headline.config(text=f"💡 {tips['headline']}")
+            self.suggest_headline.config(text=f"▎ TIPS  ·  {tips['headline']}")
         for i, (title, desc) in enumerate(tips["items"], 1):
-            card = GlowCard(self.suggest_container, self.animator, glow_color=T["prim_light"])
+            card = GlowCard(self.suggest_container, self.animator, glow_color=T["prim"])
             card.pack(fill="x", pady=5)
             inner = tk.Frame(card, bg=T["card"], padx=18, pady=14)
             inner.pack(fill="x")
-            num = tk.Frame(inner, bg=T["prim"], width=24, height=24)
+            # 序号方块（深底霓虹文字 + 等宽数字）
+            num = tk.Frame(inner, bg=T["prim"], width=28, height=28)
             num.pack(side="left", padx=(0, 14))
             num.pack_propagate(False)
-            tk.Label(num, text=str(i), font=F["tiny"], fg=T["white"],
+            tk.Label(num, text=f"{i:02d}", font=F["mono_b"], fg=T["bg"],
                     bg=T["prim"]).place(relx=0.5, rely=0.5, anchor="center")
             tf = tk.Frame(inner, bg=T["card"])
             tf.pack(side="left", fill="x", expand=True)
@@ -1734,11 +1937,11 @@ if __name__ == "__main__":
         pass
     style = ttk.Style()
     style.theme_use("clam")
-    # 自定义滚动条样式：主题配色 + 悬停/拖动反馈，方便用户精确定位
+    # 自定义滚动条样式：HUD 暗底 + 霓虹青滑块，悬停/拖动时更亮
     style.configure(
         "Mood.Vertical.TScrollbar",
         troughcolor=T["nav_bg"],
-        background=T["prim_light"],
+        background=T["prim_dark"],
         bordercolor=T["nav_bg"],
         arrowcolor=T["prim"],
         gripcount=0,
@@ -1747,11 +1950,11 @@ if __name__ == "__main__":
     )
     style.map(
         "Mood.Vertical.TScrollbar",
-        background=[("active", T["prim"]), ("pressed", T["prim_dark"])],
-        arrowcolor=[("active", T["prim_dark"])],
+        background=[("active", T["prim"]), ("pressed", T["prim_light"])],
+        arrowcolor=[("active", T["prim_light"])],
     )
     # 兼容旧引用
-    style.configure("TScrollbar", troughcolor=T["bg"], background=T["prim_light"],
+    style.configure("TScrollbar", troughcolor=T["bg"], background=T["prim_dark"],
                     bordercolor=T["bg"], arrowcolor=T["prim"])
     app = MoodApp(root)
     root.mainloop()
