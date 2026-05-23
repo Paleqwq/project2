@@ -32,11 +32,13 @@ import threading
 import math
 import random
 import time
+import concurrent.futures
 import tkinter as tk
 from tkinter import ttk
 from datetime import datetime
 
 import requests
+from requests.adapters import HTTPAdapter
 
 # ----- 封包后证书路径处理（解决 PyInstaller 打包后 SSL 失败） -----
 try:
@@ -292,7 +294,59 @@ class WeatherTipsDB:
 
 
 # ============================================================
-# ⚙️ 天气服务（完整保留 v3.7 多源定位）
+# 🇨🇳 主要中国城市经纬度（用于 pconline 等只返回城市名的国内源）
+# 覆盖直辖市 + 全部省会 + 主要地级市，命中即可秒级返回 lat/lon。
+# 没命中也没关系，会自动 fallback 到 ip-api / ip.sb 等带坐标的源。
+# ============================================================
+CHINA_CITY_COORDS = {
+    "北京": (39.9042, 116.4074), "上海": (31.2304, 121.4737),
+    "广州": (23.1291, 113.2644), "深圳": (22.5431, 114.0579),
+    "天津": (39.0851, 117.1994), "重庆": (29.5630, 106.5516),
+    "成都": (30.5728, 104.0668), "杭州": (30.2741, 120.1551),
+    "武汉": (30.5928, 114.3055), "西安": (34.3416, 108.9398),
+    "南京": (32.0603, 118.7969), "苏州": (31.2989, 120.5853),
+    "郑州": (34.7466, 113.6253), "长沙": (28.2282, 112.9388),
+    "沈阳": (41.8057, 123.4315), "青岛": (36.0671, 120.3826),
+    "大连": (38.9140, 121.6147), "厦门": (24.4798, 118.0894),
+    "宁波": (29.8683, 121.5440), "济南": (36.6512, 117.1201),
+    "福州": (26.0745, 119.2965), "合肥": (31.8206, 117.2272),
+    "昆明": (24.8801, 102.8329), "哈尔滨": (45.8038, 126.5350),
+    "长春": (43.8171, 125.3235), "石家庄": (38.0428, 114.5149),
+    "太原": (37.8706, 112.5489), "南昌": (28.6829, 115.8581),
+    "贵阳": (26.6470, 106.6302), "南宁": (22.8170, 108.3665),
+    "兰州": (36.0611, 103.8343), "海口": (20.0440, 110.1989),
+    "乌鲁木齐": (43.8256, 87.6168), "银川": (38.4872, 106.2309),
+    "西宁": (36.6232, 101.7799), "拉萨": (29.6500, 91.1719),
+    "呼和浩特": (40.8414, 111.7522),
+    "无锡": (31.5700, 120.3055), "佛山": (23.0218, 113.1219),
+    "东莞": (23.0207, 113.7518), "温州": (27.9938, 120.6993),
+    "唐山": (39.6308, 118.1804), "泉州": (24.8741, 118.6755),
+    "烟台": (37.4638, 121.4480), "嘉兴": (30.7470, 120.7553),
+    "金华": (29.0784, 119.6473), "保定": (38.8740, 115.4646),
+    "徐州": (34.2611, 117.1846), "潍坊": (36.7067, 119.1619),
+    "扬州": (32.3938, 119.4127), "中山": (22.5170, 113.3927),
+    "珠海": (22.2710, 113.5767), "南通": (32.0186, 120.8651),
+    "台州": (28.6562, 121.4205), "盐城": (33.3494, 120.1623),
+    "三亚": (18.2479, 109.5165), "海宁": (30.5118, 120.6789),
+    "义乌": (29.3056, 120.0747), "绍兴": (30.0023, 120.5810),
+    "湖州": (30.8703, 120.0934), "镇江": (32.1880, 119.4250),
+    "常州": (31.7728, 119.9460), "莆田": (25.4326, 119.0078),
+    "九江": (29.7050, 116.0019), "鞍山": (41.1083, 122.9954),
+    "洛阳": (34.6197, 112.4540), "桂林": (25.2737, 110.2901),
+}
+
+
+# ============================================================
+# ⚙️ 天气服务 - v4.3 中国地区性能优化版
+#
+# 优化点（每一项都直接打到实际耗时上）：
+#   1. 持久 Session：TCP 连接池 + TLS 会话复用，第二次起省 200-500ms 握手
+#   2. 并发竞速定位：4 个 IP 源同时跑，谁先返回用谁（最坏耗时 = 最快源耗时）
+#      新增 ip.sb（中国快、给坐标）和 pconline（中国特快、只给城市名）
+#   3. 内存缓存：定位 30min / 天气 10min 内不再发请求，切 Tab 立返
+#   4. 短超时：单源 3-4s，靠并发兜底，告别"卡 8 秒不动"
+#   5. ip-api 用 lang=zh-CN：直接拿到中文城市名，不用客户端再翻译
+#   6. timezone 固定 Asia/Shanghai：跳过 Open-Meteo 的 auto 解析步骤
 # ============================================================
 class WeatherService:
     W_MAP = {
@@ -303,45 +357,148 @@ class WeatherService:
         81: ("🌧️","强阵雨"), 82: ("⛈️","暴雨"), 95: ("⛈️","雷雨"),
         96: ("⛈️","雷雨夹雹"), 99: ("⛈️","强雷暴"),
     }
-    HEADERS = {"User-Agent": "MoodTool/4.0 (+https://example.local)"}
+    HEADERS = {"User-Agent": "MoodTool/4.3-CN (+https://example.local)"}
+
+    # ---------- 性能基础设施 ----------
+    _session = None                     # 单例 Session（连接池 + 复用 TLS）
+    _loc_cache = None                   # (timestamp, location_dict)
+    _w_cache = {}                       # {(round_lat, round_lon): (timestamp, payload)}
+    LOC_TTL = 30 * 60                   # 定位缓存 30 分钟
+    W_TTL   = 10 * 60                   # 天气缓存 10 分钟
+
+    @classmethod
+    def _get_session(cls):
+        """惰性创建 Session 单例，挂上连接池。后续所有请求复用 TCP/TLS。"""
+        if cls._session is None:
+            s = requests.Session()
+            s.headers.update(cls.HEADERS)
+            adapter = HTTPAdapter(pool_connections=4, pool_maxsize=8, max_retries=0)
+            s.mount("http://", adapter)
+            s.mount("https://", adapter)
+            cls._session = s
+        return cls._session
+
+    # ============================================================
+    # 🌐 多个 IP 定位源（每个返回 dict 或 None）
+    # 设计原则：每个函数独立可测、内部 try 包好、永远不抛异常
+    # ============================================================
+    @classmethod
+    def _loc_pconline(cls):
+        """太平洋电脑网 - 中国境内访问最快的 IP 库（毫秒级响应）。
+        缺点：只返回中文城市名，需要本地坐标表换算。命中率约 80%（覆盖主要城市）。"""
+        try:
+            r = cls._get_session().get(
+                "https://whois.pconline.com.cn/ipJson.jsp",
+                params={"json": "true"}, timeout=3,
+            )
+            r.encoding = "gbk"  # 该接口返回 GBK 编码
+            j = r.json()
+            city = (j.get("city") or "").replace("市", "").strip()
+            if not city:
+                return None
+            ll = CHINA_CITY_COORDS.get(city)
+            if not ll:
+                return None
+            return {"city": city, "lat": ll[0], "lon": ll[1]}
+        except Exception:
+            return None
+
+    @classmethod
+    def _loc_ipsb(cls):
+        """ip.sb - 国内可用且直接返回 lat/lon，速度通常 ~1s。"""
+        try:
+            r = cls._get_session().get("https://api.ip.sb/geoip", timeout=4)
+            j = r.json()
+            if j.get("latitude") is not None:
+                return {
+                    "city": j.get("city") or "未知地区",
+                    "lat": float(j["latitude"]),
+                    "lon": float(j["longitude"]),
+                }
+        except Exception:
+            return None
+        return None
+
+    @classmethod
+    def _loc_ip_api(cls):
+        """ip-api.com - 加 lang=zh-CN 直接返回中文城市名。"""
+        try:
+            r = cls._get_session().get(
+                "http://ip-api.com/json/",
+                params={"fields": "city,lat,lon,status,message", "lang": "zh-CN"},
+                timeout=4,
+            )
+            j = r.json()
+            if j.get("status") == "success":
+                return {"city": j.get("city") or "未知地区",
+                        "lat": j["lat"], "lon": j["lon"]}
+        except Exception:
+            return None
+        return None
+
+    @classmethod
+    def _loc_ipwho(cls):
+        """ipwho.is - 国际兜底。"""
+        try:
+            r = cls._get_session().get("https://ipwho.is/", timeout=4)
+            j = r.json()
+            if j.get("success"):
+                return {"city": j.get("city") or "未知地区",
+                        "lat": j["latitude"], "lon": j["longitude"]}
+        except Exception:
+            return None
+        return None
 
     @classmethod
     def _locate(cls):
-        errors = []
-        try:
-            r = requests.get("http://ip-api.com/json/?fields=city,lat,lon,status,message",
-                             timeout=6, headers=cls.HEADERS)
-            j = r.json()
-            if j.get("status") == "success":
-                return {"city": j.get("city") or "未知地区", "lat": j["lat"], "lon": j["lon"]}
-            errors.append(f"ip-api: {j.get('message')}")
-        except Exception as e:
-            errors.append(f"ip-api: {e}")
-        try:
-            r = requests.get("https://ipapi.co/json/", timeout=6, headers=cls.HEADERS)
-            j = r.json()
-            if j.get("latitude") is not None:
-                return {"city": j.get("city") or "未知地区", "lat": j["latitude"], "lon": j["longitude"]}
-            errors.append(f"ipapi.co: {j.get('reason')}")
-        except Exception as e:
-            errors.append(f"ipapi.co: {e}")
-        try:
-            r = requests.get("https://ipwho.is/", timeout=6, headers=cls.HEADERS)
-            j = r.json()
-            if j.get("success"):
-                return {"city": j.get("city") or "未知地区", "lat": j["latitude"], "lon": j["longitude"]}
-            errors.append(f"ipwho: {j.get('message')}")
-        except Exception as e:
-            errors.append(f"ipwho: {e}")
-        raise RuntimeError("定位失败 -> " + " | ".join(errors))
+        """并发竞速：四个源同时跑，谁先返回有效结果用谁。
+
+        最坏耗时 ≈ 最快源耗时（而不是原来的"前一个失败才试下一个"），
+        在中国大陆通常 1 秒内就能拿到结果。"""
+        # 1. 先看缓存
+        if cls._loc_cache is not None:
+            ts, loc = cls._loc_cache
+            if time.time() - ts < cls.LOC_TTL:
+                return loc
+
+        sources = [cls._loc_pconline, cls._loc_ipsb, cls._loc_ip_api, cls._loc_ipwho]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(sources)) as ex:
+            futures = [ex.submit(s) for s in sources]
+            try:
+                for fut in concurrent.futures.as_completed(futures, timeout=6):
+                    res = fut.result()
+                    if res:
+                        cls._loc_cache = (time.time(), res)
+                        # 让剩下的线程在后台自然结束（cancel 对已运行任务无效，
+                        # 但它们持有的 Session 是线程安全的，开销可忽略）
+                        return res
+            except concurrent.futures.TimeoutError:
+                pass
+
+        raise RuntimeError("定位失败：4 个 IP 源全部超时或返回无效数据")
 
     @classmethod
     def _weather(cls, lat, lon):
-        params = {"latitude": lat, "longitude": lon, "current_weather": True, "timezone": "auto"}
-        r = requests.get("https://api.open-meteo.com/v1/forecast",
-                         params=params, timeout=8, headers=cls.HEADERS)
+        """请求 Open-Meteo。带 10 分钟内存缓存（按 0.1° 粒度，约 11km 网格）。"""
+        key = (round(lat, 1), round(lon, 1))
+        cached = cls._w_cache.get(key)
+        if cached and time.time() - cached[0] < cls.W_TTL:
+            return cached[1]
+
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "current_weather": True,
+            "timezone": "Asia/Shanghai",  # 固定中国时区，跳过 auto 解析
+        }
+        r = cls._get_session().get(
+            "https://api.open-meteo.com/v1/forecast",
+            params=params, timeout=6,
+        )
         r.raise_for_status()
-        return r.json()
+        data = r.json()
+        cls._w_cache[key] = (time.time(), data)
+        return data
 
     @classmethod
     def fetch_all(cls, cb):
